@@ -164,7 +164,7 @@ export class LspManager {
       this.instances.set(key, instance);
       instance.ready = (async () => {
         const response = await instance.transport.request('initialize', {
-          processId: process.pid, clientInfo: { name: 'dsh-lsp-bridge', version: '0.1.0' },
+          processId: process.pid, clientInfo: { name: 'dsh-lsp-bridge', version: '0.2.0' },
           rootPath: root, rootUri: uriFor(root), workspaceFolders,
           initializationOptions: server.initializationOptions ?? null,
           capabilities: {

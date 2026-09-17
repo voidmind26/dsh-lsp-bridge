@@ -1,6 +1,6 @@
 {
   "name": "dsh-lsp-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bridge DeepSeek Harness to language servers for read-only code intelligence, with multi-language configuration, multi-root workspace support, and session-scoped server reuse.",
   "author": "voidmind26 <voidmind26@gmail.com>",
   "repository": {
@@ -8,14 +8,56 @@
     "url": "git+https://github.com/voidmind26/dsh-lsp-bridge.git"
   },
   "homepage": "https://github.com/voidmind26/dsh-lsp-bridge#readme",
-  "bugs": { "url": "https://github.com/voidmind26/dsh-lsp-bridge/issues" },
+  "bugs": {
+    "url": "https://github.com/voidmind26/dsh-lsp-bridge/issues"
+  },
   "type": "module",
   "main": "src/index.js",
-  "exports": { ".": "./src/index.js", "./engine": "./src/engine.js" },
-  "files": ["src", "examples", "docs", "cordis.patch.yml", "README.md"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
-  "keywords": ["dsh-plugin", "deepseek-harness", "lsp", "language-server"],
-  "scripts": { "test": "node --test test/*.test.js", "check": "node --check src/index.js && node --check src/pool.js && node --check src/engine.js && node --check src/transport.js" },
-  "engines": { "node": ">=22" },
-  "license": "MIT"
+  "exports": {
+    ".": "./src/index.js",
+    "./engine": "./src/engine.js",
+    "./client": "./lib/client.js"
+  },
+  "files": [
+    "src",
+    "lib/client.js",
+    "scripts/build-client.mjs",
+    "examples",
+    "docs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "lsp",
+    "language-server"
+  ],
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/index.js && node --check src/catalog.js && node --check src/discovery.js && node --check src/pool.js && node --check src/engine.js && node --check src/transport.js && node --check src/client.js && node --check lib/client.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "3.18.2"
+  }
 }

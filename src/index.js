@@ -1,8 +1,14 @@
 import { isAbsolute } from 'node:path';
+import z from '@deepseek-ai/schemastery';
+import { discoverWorkspace } from './discovery.js';
 import { LspSessionPool, POLICY_POLL_INTERVAL_MS } from './pool.js';
 
 export const name = 'dsh-lsp-bridge';
+// settings、connection 与 sessions 通过 ctx.inject 可选接入，不能变成部署硬依赖。
 export const inject = ['tools', 'sandboxPolicy'];
+export const SETTINGS_NAMESPACE = 'dsh-lsp-bridge';
+export const DISCOVERY_PATH = '/api/dsh-lsp-bridge/discovery';
+export const DISCOVERY_MAX_BODY_BYTES = 16 * 1024;
 export const OPERATIONS = ['status', 'hover', 'definition', 'references', 'implementation', 'typeDefinition', 'documentSymbols', 'workspaceSymbols', 'diagnostics'];
 const POSITION_OPERATIONS = new Set(['hover', 'definition', 'references', 'implementation', 'typeDefinition']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -41,7 +47,7 @@ export function validateConfig(input = {}) {
   return config;
 }
 
-// Cordis accepts Standard Schema directly; no Schemastery/runtime peer dependency is needed.
+// Cordis 插件配置使用 Standard Schema；设置命名空间另使用宿主 Schemastery schema。
 export const Config = {
   '~standard': {
     version: 1,
@@ -52,6 +58,36 @@ export const Config = {
     },
   },
 };
+
+function parseSettingsConfig(configJson) {
+  let parsed;
+  try { parsed = JSON.parse(configJson); }
+  catch { throw new TypeError('dsh-lsp-bridge: configJson 必须是有效 JSON'); }
+  const config = validateConfig(parsed);
+  assert(config.servers.every(server => server.env === undefined), 'UI 不支持编辑 env；请仅在部署配置中设置环境变量。');
+  return config;
+}
+
+export function settingsValue(input) {
+  const config = validateConfig(input);
+  config.servers = config.servers.map(({ env, ...server }) => server);
+  return { configJson: JSON.stringify(config, null, 2) };
+}
+
+// JSON 是普通设置文本，不提供机密字段脱敏；禁止在 UI 存放凭据，env 仅由部署配置提供。
+function settingsSchema() {
+  return z.object({ configJson: z.string().default(JSON.stringify(validateConfig({}), null, 2)).description('可信服务配置 JSON；请勿填写凭据。env 仅支持部署配置，界面保存会保留原 env。') });
+}
+
+function restoreEnvironment(config, base) {
+  config.servers = config.servers.map(server => {
+    const original = base.servers.find(item => item.id === server.id);
+    if (!original?.env) return server;
+    assert(server.command === original.command && JSON.stringify(server.args) === JSON.stringify(original.args), '含部署 env 的服务不允许在 UI 修改启动命令或参数。');
+    return { ...server, env: { ...original.env } };
+  });
+  return config;
+}
 
 export const parameters = {
   type: 'object', additionalProperties: false, required: ['operation'],
@@ -94,18 +130,148 @@ function boundedResult(value, limit) {
   return { json, truncated: true };
 }
 
+function jsonResponse(value, status = 200) {
+  return Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
+}
+
+function errorResponse(status, code, message) {
+  return jsonResponse({ error: { code, message } }, status);
+}
+
+function discoveryBody(value) {
+  assert(object(value), '请求体必须是 JSON 对象');
+  const allowed = new Set(['sessionId', 'refresh', 'languages']);
+  for (const key of Object.keys(value)) assert(allowed.has(key), `请求体不允许字段 ${key}`);
+  assert(nonempty(value.sessionId), 'sessionId 必须是非空字符串');
+  if (value.refresh !== undefined) assert(typeof value.refresh === 'boolean', 'refresh 必须是布尔值');
+  if (value.languages !== undefined) strings(value.languages, 'languages');
+  return value;
+}
+
+async function readDiscoveryBody(request) {
+  const mediaType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+  if (mediaType !== 'application/json') return { response: errorResponse(415, 'unsupported-media-type', '请求体必须使用 application/json。') };
+  const declared = request.headers.get('content-length');
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > DISCOVERY_MAX_BODY_BYTES)) {
+    return { response: errorResponse(400, 'invalid-request', '请求体超过 16 KiB 限制。') };
+  }
+  const reader = request.body?.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    if (reader) for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > DISCOVERY_MAX_BODY_BYTES) {
+        await reader.cancel();
+        return { response: errorResponse(400, 'invalid-request', '请求体超过 16 KiB 限制。') };
+      }
+      chunks.push(value);
+    }
+  } catch { return { response: errorResponse(400, 'invalid-request', '无法读取请求体。') }; }
+  finally { reader?.releaseLock(); }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try { return { body: discoveryBody(JSON.parse(new TextDecoder().decode(bytes))) }; }
+  catch { return { response: errorResponse(400, 'invalid-request', '请求体不是有效的发现请求。') }; }
+}
+
+function liveSessions(sessions) {
+  const values = typeof sessions.list === 'function' ? sessions.list() : [];
+  return values.flatMap(session => {
+    const id = session?.header?.id;
+    const cwd = session?.header?.cwd;
+    return nonempty(id) && nonempty(cwd) && isAbsolute(cwd) ? [{ id, cwd }] : [];
+  });
+}
+
 export function apply(ctx, input = {}) {
-  const config = validateConfig(input);
-  const pool = new LspSessionPool(config, session => ctx.sandboxPolicy.resolve({ session }));
-  // 已核对 dsh-session 的真实事件签名；测试/精简宿主没有 on 时由轮询兜底。
+  const baseConfig = validateConfig(input);
+  let config = baseConfig;
+  const retiring = new Set();
+  const environmentBase = structuredClone(baseConfig);
+  const makePool = value => new LspSessionPool(value, session => ctx.sandboxPolicy.resolve({ session }));
+  let pool = makePool(config);
+  let disposed = false;
+  const replacePool = nextConfig => {
+    if (disposed) return Promise.resolve();
+    if (JSON.stringify(nextConfig) === JSON.stringify(config)) return Promise.resolve();
+    const nextPool = makePool(nextConfig);
+    const previous = pool;
+    config = nextConfig;
+    pool = nextPool;
+    const closing = previous.dispose();
+    retiring.add(closing);
+    closing.then(() => retiring.delete(closing), () => retiring.delete(closing));
+    return closing;
+  };
+
+  // 事件闭包始终解引用当前池，设置热替换后不会继续操作旧实例。
   if (typeof ctx.on === 'function') {
     ctx.on('session/event', (session, event) => pool.policyChanged(session, event));
     ctx.on('session/disposed', session => pool.sessionDisposed(session));
   }
-  ctx.effect(() => () => pool.dispose(), 'dsh-lsp-bridge: language server lifetime');
+  ctx.effect(() => async () => {
+    disposed = true;
+    await Promise.allSettled([pool.dispose(), ...retiring]);
+  }, 'dsh-lsp-bridge: language server lifetime');
+
+  // settings 是可选 Host 能力；无该服务时保持原有 composition 配置行为。
+  if (typeof ctx.inject === 'function') ctx.inject(['settings'], settingsCtx => {
+    const scope = settingsCtx.settings.register(SETTINGS_NAMESPACE, settingsSchema(), {
+      base: settingsValue(baseConfig),
+      applies: 'live',
+      validate: value => restoreEnvironment(parseSettingsConfig(value.configJson), environmentBase),
+    });
+    const activate = value => replacePool(restoreEnvironment(parseSettingsConfig(value.configJson), environmentBase));
+    let tail = activate(scope.get());
+    const unwatch = scope.watch(next => (tail = tail.catch(() => {}).then(() => activate(next))));
+    settingsCtx.effect?.(() => async () => {
+      unwatch();
+      await tail.catch(() => {});
+      if (!disposed) await replacePool(baseConfig);
+    }, 'dsh-lsp-bridge: settings watcher');
+  });
+
+  // connection 自带 Host/Origin 与浏览器认证围栏；只在 sessions 同时存在时注册 UI API。
+  if (typeof ctx.inject === 'function') ctx.inject(['connection', 'sessions'], hostCtx => {
+    hostCtx.effect(() => hostCtx.connection.fetch.register({
+      path: DISCOVERY_PATH,
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        if (request.method === 'GET') return jsonResponse({ sessions: liveSessions(hostCtx.sessions) });
+        const parsed = await readDiscoveryBody(request);
+        if (parsed.response) return parsed.response;
+        const session = hostCtx.sessions.get(parsed.body.sessionId);
+        if (!session || !nonempty(session.header?.cwd) || !isAbsolute(session.header.cwd)) {
+          return errorResponse(404, 'session-not-found', '找不到可用于发现的活动会话。');
+        }
+        let policy;
+        try { policy = ctx.sandboxPolicy.resolve({ session }); }
+        catch { return errorResponse(500, 'policy-failure', '无法核对会话权限。'); }
+        if (policy?.mode !== 'danger-full-access') {
+          return errorResponse(403, 'danger-full-access-required', '自动发现目前仅允许 danger-full-access 会话；不会自动提权。');
+        }
+        try {
+          const result = await discoverWorkspace({ workspace: session.header.cwd, languages: parsed.body.languages, signal: request.signal });
+          return jsonResponse(result);
+        } catch (error) {
+          if (request.signal.aborted) return errorResponse(400, 'request-aborted', '自动发现请求已取消。');
+          if (error instanceof TypeError || error instanceof RangeError) {
+            return errorResponse(400, 'invalid-request', '自动发现参数无效。');
+          }
+          return errorResponse(500, 'discovery-failed', '自动发现失败。');
+        }
+      },
+    }), 'dsh-lsp-bridge: discovery API');
+  });
+
   ctx.tools.register({
     name: 'lsp',
-    description: `查询可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号和诊断。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。空闲 ${config.idleTimeoutMs} 毫秒后回收，最多 ${config.maxSessions} 个会话工作区，每个最多 ${config.maxInstances} 个服务实例；活动请求不会因空闲或容量被回收。不暴露编辑或命令。服务是未经 OS 沙箱隔离的可信程序，每次调用要求 danger-full-access，绝不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查，未收到事件的权限变化存在最多一个轮询周期加事件循环调度与进程退出的延迟。`,
+    description: `查询可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号和诊断。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。不暴露编辑或命令。服务是未经 OS 沙箱隔离的可信程序，每次调用要求 danger-full-access，绝不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查。`,
     parameters,
     output: {
       schema: { type: 'object', additionalProperties: false, required: ['json', 'truncated'], properties: { json: { type: 'string' }, truncated: { type: 'boolean' } } },

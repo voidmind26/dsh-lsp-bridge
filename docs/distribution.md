@@ -9,10 +9,10 @@
 - `package.json` 声明 `dsh.bundle.patch: ./cordis.patch.yml`。
 - 包根的 patch 使用包名 `dsh-lsp-bridge` 挂载 `lsp`，不绑定个人绝对路径或 profile 名称。
 - `main` 与 `exports["."]` 指向真实服务端 Cordis 插件；已有工具实现和测试，不是只有依赖的聚合包。
-- `files` 包含源码、Bundle patch、示例与文档，纯 ESM JavaScript 无需构建，无安装期脚本。
-- 没有前端 UI，因此不声明 `dsh.client` 或虚构截图。
-- 本实现没有导入官方 `@deepseek-ai/*` 包，也没有把官方包声明为 dependencies。当前不需要为不存在的模块依赖增加 peerDependencies；以后引入官方包时应使用 peerDependencies，并明确覆盖所支持版本的 prerelease 分支。
-- web 和 desktop 使用同一个服务端 Bundle，区别仅在安装所用 CLI 和 profile。
+- `files` 包含源码、预生成客户端 Bundle、Bundle patch、示例与文档，无安装期脚本。GitHub 源安装不需要运行构建。
+- 声明 `dsh.client.platform: web` 与 `exports["./client"]`，同一设置 UI 同时供 web 和 Desktop 使用；不虚构截图。
+- Host 设置 schema 导入官方 `@deepseek-ai/schemastery`，按收录规范声明为 peerDependency，并以 devDependency 支撑独立测试；其余官方 Client 模块由宿主注入，客户端通过 ModuleLoader require，不作为运行依赖重复安装。
+- web 和 desktop 使用同一个服务端 Bundle 与客户端 Bundle，区别仅在安装所用 CLI 和 profile。
 
 ## 发布前仍需人工完成
 
@@ -34,8 +34,8 @@ url: https://github.com/voidmind26/dsh-lsp-bridge
 name: voidmind26/dsh-lsp-bridge
 category: dev
 description:
-  en: 'Read-only multi-language LSP queries with session-scoped server reuse and multi-root project configuration for DeepSeek Harness.'
-  zh: '为 DeepSeek Harness 提供只读多语言 LSP 查询，支持会话级服务器复用与多根项目配置。'
+  en: 'Multi-language LSP queries for DeepSeek Harness with a configuration UI, bounded workspace discovery, multi-root projects, and session-scoped server reuse.'
+  zh: '为 DeepSeek Harness 提供多语言 LSP 查询、配置界面、有界工作区发现、多根项目及会话级服务器复用。'
 ```
 
 英文描述是对方收录格式的必填字段，保留中英文描述；其余项目文档使用中文。若最终采用 monorepo，按贡献指南改为子目录 URL、`owner/repo#subname` 名称和对应文件名。

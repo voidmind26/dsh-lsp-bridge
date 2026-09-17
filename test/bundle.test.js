@@ -17,7 +17,10 @@ test('Bundle 清单包含可分发入口与挂载文件', async () => {
   assert.match(patch, new RegExp(`name: ${pkg.name}`));
   assert.match(patch, /servers: \[\]/);
   assert.doesNotMatch(patch, /\/Users\/|\/Applications\/|profile:/);
-  assert.equal(pkg.dsh.client, undefined);
+  assert.equal(pkg.dsh.client.platform, 'web');
+  assert.ok(pkg.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-settings'));
+  assert.equal(pkg.exports['./client'], './lib/client.js');
+  await access(new URL('lib/client.js', root));
   for (const key of ['preinstall', 'install', 'postinstall', 'prepare']) assert.equal(pkg.scripts[key], undefined);
   assert.ok(!Object.keys(pkg.dependencies ?? {}).some(name => name.startsWith('@deepseek-ai/')));
 });

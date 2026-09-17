@@ -2,7 +2,7 @@
 
 Bridge DeepSeek Harness to language servers for read-only code intelligence, with multi-language configuration, multi-root workspace support, and session-scoped server reuse.
 
-为 DeepSeek Harness 的 LLM 提供通用 LSP 查询工具 `lsp`。支持按语言配置多个 stdio 语言服务器、独立项目根目录和显式多根工作区。Node.js ≥22，无 npm 运行时依赖，无需编译。
+为 DeepSeek Harness 的 LLM 提供通用 LSP 查询工具 `lsp`。支持按语言配置多个 stdio 语言服务器、独立项目根目录和显式多根工作区，并在 Web 与 Desktop 的插件设置中提供自动发现和配置界面。Node.js ≥22，无安装期构建。
 
 ## 能力
 
@@ -75,6 +75,20 @@ dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 
 **验证范围：** 已有协议、生命周期、Bundle 结构及模拟宿主契约测试；尚未修改运行中的 profile，不能把这些测试视为真实 web/Desktop GUI 安装成功。分发与收录检查见 [分发说明](docs/distribution.md)。
 
+## 设置 UI 与自动发现
+
+安装并重新加载宿主后，进入「设置 → 插件 → 可配置」，打开 `dsh-lsp-bridge` 卡片：
+
+1. 选择一个当前活动会话；列表中的目录是服务端会话记录，不接受浏览器提交任意扫描路径。
+2. 点击“扫描当前工作区”。插件检查固定 catalog 中的 Go、Rust、TypeScript/JavaScript、Python 和 C/C++ 项目标记与服务器候选。
+3. 查看可用候选、多候选提示及缺失服务器的安装建议。扫描不会执行候选、版本命令或安装命令，也不会修改工程文件。
+4. 确认信任候选程序后，将建议合入配置编辑器；多候选需要明确选择。可以继续编辑完整 JSON。
+5. 点击保存后，Host 再次校验配置并热替换服务池；保存本身不会启动服务器，下一次语义查询才懒启动。
+
+UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现有扫描深度、目录/项目数和时间限制；若结果被截断，界面会明确提示，不能把它当成完整枚举。内置 catalog 以外的语言仍可手工配置。
+
+缺失时只给出命令文本或安装说明，插件不会代替用户运行 `go install`、`npm install`、`rustup`、Homebrew 或系统包管理器。当前发现接口与语言服务器启动一样要求目标会话为 `danger-full-access`，不会自动提权。
+
 ## 通用配置
 
 见 `examples/generic.config.json`（Go、Python、TypeScript/JavaScript）及 `examples/uos.config.json`（uos 独立 Go module 与前端工程）。支持任何兼容 stdio LSP 的服务器，**不代表插件自动下载服务器或配置其语言 SDK**。
@@ -123,6 +137,7 @@ dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 ## 开发与验证
 
 ```sh
+npm run build:client
 npm run check
 npm test
 # 可选真实 Go LSP 集成验证，仅在临时 Go module 内运行：
