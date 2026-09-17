@@ -1,4 +1,6 @@
-# dsh-plugin-lsp
+# dsh-lsp-bridge
+
+Bridge DeepSeek Harness to language servers for read-only code intelligence, with multi-language configuration, multi-root workspace support, and session-scoped server reuse.
 
 为 DeepSeek Harness 的 LLM 提供通用 LSP 查询工具 `lsp`。支持按语言配置多个 stdio 语言服务器、独立项目根目录和显式多根工作区。Node.js ≥22，无 npm 运行时依赖，无需编译。
 
