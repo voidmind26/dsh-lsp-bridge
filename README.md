@@ -41,10 +41,10 @@ Bridge DeepSeek Harness to language servers for read-only code intelligence, wit
 已安装 DSH CLI，且 PATH 中可用 `pnpm` 时，在本插件目录执行：
 
 ```sh
-dsh plugin --profile web add .
+dsh plugin --profile web add github:voidmind26/dsh-lsp-bridge
 ```
 
-应使用已经初始化的 web profile；安装后重启原有 web 进程并刷新页面，不要另起替代服务器。卸载：`dsh plugin --profile web remove dsh-plugin-lsp`。
+应使用已经初始化的 web profile；安装后重启原有 web 进程并刷新页面，不要另起替代服务器。卸载：`dsh plugin --profile web remove dsh-lsp-bridge`。
 
 ### Desktop profile（本机 macOS）
 
@@ -56,12 +56,12 @@ dsh_packaged() {
     --expose-internals '/Applications/DSH Desktop.app/Contents/Resources/app/lib/desktop-cli.js' "$@"
 }
 # 在本插件目录执行；需 PATH 中可用 pnpm。
-dsh_packaged plugin --profile desktop add .
+dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 # 如果使用 Desktop 自带 CLI 管理 web：
 # dsh_packaged plugin --profile web add .
 ```
 
-该命令面向 Desktop 已创建的现有 profile；不要用它代替首次启动 Desktop 初始化。应用安装路径不同时调整命令。安装后重启 Desktop，再刷新原有 GUI。卸载：`dsh_packaged plugin --profile desktop remove dsh-plugin-lsp`。其他操作系统需使用其 Desktop 提供的 CLI 入口，此处不声明已验证。
+该命令面向 Desktop 已创建的现有 profile；不要用它代替首次启动 Desktop 初始化。应用安装路径不同时调整命令。安装后重启 Desktop，再刷新原有 GUI。卸载：`dsh_packaged plugin --profile desktop remove dsh-lsp-bridge`。其他操作系统需使用其 Desktop 提供的 CLI 入口，此处不声明已验证。
 
 ### 配置与启用
 

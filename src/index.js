@@ -1,13 +1,13 @@
 import { isAbsolute } from 'node:path';
 import { LspSessionPool, POLICY_POLL_INTERVAL_MS } from './pool.js';
 
-export const name = 'dsh-plugin-lsp';
+export const name = 'dsh-lsp-bridge';
 export const inject = ['tools', 'sandboxPolicy'];
 export const OPERATIONS = ['status', 'hover', 'definition', 'references', 'implementation', 'typeDefinition', 'documentSymbols', 'workspaceSymbols', 'diagnostics'];
 const POSITION_OPERATIONS = new Set(['hover', 'definition', 'references', 'implementation', 'typeDefinition']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = value => typeof value === 'string' && value.trim().length > 0 && !value.includes('\0');
-function assert(condition, message) { if (!condition) throw new TypeError(`dsh-plugin-lsp: ${message}`); }
+function assert(condition, message) { if (!condition) throw new TypeError(`dsh-lsp-bridge: ${message}`); }
 function strings(value, label) { assert(Array.isArray(value) && value.every(nonempty), `${label} must be an array of nonempty strings`); }
 
 /** Validate trusted administrator configuration; model calls cannot supply commands or environment. */
@@ -45,7 +45,7 @@ export function validateConfig(input = {}) {
 export const Config = {
   '~standard': {
     version: 1,
-    vendor: 'dsh-plugin-lsp',
+    vendor: 'dsh-lsp-bridge',
     validate(value) {
       try { return { value: validateConfig(value) }; }
       catch (error) { return { issues: [{ message: error.message }] }; }
@@ -102,7 +102,7 @@ export function apply(ctx, input = {}) {
     ctx.on('session/event', (session, event) => pool.policyChanged(session, event));
     ctx.on('session/disposed', session => pool.sessionDisposed(session));
   }
-  ctx.effect(() => () => pool.dispose(), 'dsh-plugin-lsp: language server lifetime');
+  ctx.effect(() => () => pool.dispose(), 'dsh-lsp-bridge: language server lifetime');
   ctx.tools.register({
     name: 'lsp',
     description: `查询可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号和诊断。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。空闲 ${config.idleTimeoutMs} 毫秒后回收，最多 ${config.maxSessions} 个会话工作区，每个最多 ${config.maxInstances} 个服务实例；活动请求不会因空闲或容量被回收。不暴露编辑或命令。服务是未经 OS 沙箱隔离的可信程序，每次调用要求 danger-full-access，绝不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查，未收到事件的权限变化存在最多一个轮询周期加事件循环调度与进程退出的延迟。`,

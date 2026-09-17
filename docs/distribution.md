@@ -7,7 +7,7 @@
 ## 本包满足的结构
 
 - `package.json` 声明 `dsh.bundle.patch: ./cordis.patch.yml`。
-- 包根的 patch 使用包名 `dsh-plugin-lsp` 挂载 `lsp`，不绑定个人绝对路径或 profile 名称。
+- 包根的 patch 使用包名 `dsh-lsp-bridge` 挂载 `lsp`，不绑定个人绝对路径或 profile 名称。
 - `main` 与 `exports["."]` 指向真实服务端 Cordis 插件；已有工具实现和测试，不是只有依赖的聚合包。
 - `files` 包含源码、Bundle patch、示例与文档，纯 ESM JavaScript 无需构建，无安装期脚本。
 - 没有前端 UI，因此不声明 `dsh.client` 或虚构截图。
@@ -16,22 +16,22 @@
 
 ## 发布前仍需人工完成
 
-本地实现通过不等于满足全部收录条件。尚未创建或确认 GitHub 发布仓库，所以不能验证以下事项：
+本地实现通过不等于满足全部收录条件。公开仓库为 `https://github.com/voidmind26/dsh-lsp-bridge`，采用 MIT 许可，并已在 `package.json` 声明 repository、homepage 和 bugs 元数据。
 
-- 仓库真实 URL、维护者及 `repository` 元数据；确认后才能填入 package.json，不能伪造。
-- 仓库创建满 1 天，处于活跃维护状态。
+提交收录前仍需确认：
+
+- 仓库创建满 1 天，且继续保持非归档与活跃维护状态。
 - GitHub topic 包含 `dsh-plugin`（package.json keywords 不能替代仓库 topic）。
-- 授权方式：当前 `UNLICENSED`，对外发布前由作者明确许可。
 - 在目标 web / desktop 实例完成真实安装、工具调用及卸载验证。
 - 在列表中核对是否已有重复条目，选择贴切类别（建议 `dev`）。
 
 ## 收录条目模板
 
-仓库地址确定后，向列表仓库仅添加 `data/plugins/<owner>__<repo>.yml`，不要手工修改其生成的 README。以下是待替换的文档模板，不是可直接提交的真实条目：
+向列表仓库仅添加 `data/plugins/voidmind26__dsh-lsp-bridge.yml`，不要手工修改其生成的 README。建议条目：
 
 ```yaml
-url: https://github.com/OWNER/REPO
-name: OWNER/REPO
+url: https://github.com/voidmind26/dsh-lsp-bridge
+name: voidmind26/dsh-lsp-bridge
 category: dev
 description:
   en: 'Read-only multi-language LSP queries with session-scoped server reuse and multi-root project configuration for DeepSeek Harness.'
@@ -44,4 +44,4 @@ description:
 
 在插件目录执行 `npm pack` 即可生成包含所有运行时代码的 `.tgz`，不依赖安装时编译。发布 npm 不是收录必需条件。也可将打包产物附到 GitHub Release；若使用可选 `tarball` 字段，必须是真实 GitHub Release HTTPS `.tgz` 地址。不要将版本化文件名放到会随发布变化的 `latest/download/` 地址中。
 
-本项目不自动发布 npm、不创建 GitHub 仓库、不添加 topic、不提交收录 PR。
+本项目不会自动发布 npm或提交收录 PR。GitHub topic、仓库描述等仓库元数据需使用 GitHub 管理接口维护。

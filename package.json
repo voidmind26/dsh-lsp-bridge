@@ -1,7 +1,14 @@
 {
-  "name": "dsh-plugin-lsp",
+  "name": "dsh-lsp-bridge",
   "version": "0.1.0",
-  "description": "Read-only multi-language, multi-root LSP tools for DeepSeek Harness",
+  "description": "Bridge DeepSeek Harness to language servers for read-only code intelligence, with multi-language configuration, multi-root workspace support, and session-scoped server reuse.",
+  "author": "voidmind26 <voidmind26@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voidmind26/dsh-lsp-bridge.git"
+  },
+  "homepage": "https://github.com/voidmind26/dsh-lsp-bridge#readme",
+  "bugs": { "url": "https://github.com/voidmind26/dsh-lsp-bridge/issues" },
   "type": "module",
   "main": "src/index.js",
   "exports": { ".": "./src/index.js", "./engine": "./src/engine.js" },
@@ -10,5 +17,5 @@
   "keywords": ["dsh-plugin", "deepseek-harness", "lsp", "language-server"],
   "scripts": { "test": "node --test test/*.test.js", "check": "node --check src/index.js && node --check src/pool.js && node --check src/engine.js && node --check src/transport.js" },
   "engines": { "node": ">=22" },
-  "license": "UNLICENSED"
+  "license": "MIT"
 }
