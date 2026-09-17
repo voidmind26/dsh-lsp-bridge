@@ -1,0 +1,14 @@
+{
+  "name": "dsh-plugin-lsp",
+  "version": "0.1.0",
+  "description": "Read-only multi-language, multi-root LSP tools for DeepSeek Harness",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": { ".": "./src/index.js", "./engine": "./src/engine.js" },
+  "files": ["src", "examples", "docs", "cordis.patch.yml", "README.md"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "keywords": ["dsh-plugin", "deepseek-harness", "lsp", "language-server"],
+  "scripts": { "test": "node --test test/*.test.js", "check": "node --check src/index.js && node --check src/pool.js && node --check src/engine.js && node --check src/transport.js" },
+  "engines": { "node": ">=22" },
+  "license": "UNLICENSED"
+}

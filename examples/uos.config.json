@@ -1,0 +1,24 @@
+{
+  "timeoutMs": 30000,
+  "maxInstances": 12,
+  "maxFileBytes": 2097152,
+  "servers": [
+    {
+      "id": "go",
+      "command": "/Users/voidmind/go/bin/gopls",
+      "args": ["serve"],
+      "languages": { "go": [".go"] },
+      "rootMarkers": ["go.work", "go.mod"],
+      "roots": ["qsl-game-server", "qsl-room-server", "unityroomlib", "unity-server", "zyb-uos-web", "uos-game-web", "game-web", "room-web", "zyb-uos-mis"],
+      "settings": { "gopls": { "staticcheck": false } }
+    },
+    {
+      "id": "typescript",
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "languages": { "typescript": [".ts"], "typescriptreact": [".tsx"], "javascript": [".js", ".mjs", ".cjs"], "javascriptreact": [".jsx"] },
+      "roots": ["uos-admin-fe"],
+      "rootMarkers": ["tsconfig.json", "jsconfig.json", "package.json"]
+    }
+  ]
+}

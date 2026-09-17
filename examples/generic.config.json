@@ -1,0 +1,28 @@
+{
+  "timeoutMs": 30000,
+  "maxInstances": 8,
+  "maxFileBytes": 2097152,
+  "servers": [
+    {
+      "id": "go",
+      "command": "gopls",
+      "args": ["serve"],
+      "languages": { "go": [".go"] },
+      "rootMarkers": ["go.work", "go.mod"]
+    },
+    {
+      "id": "python",
+      "command": "pyright-langserver",
+      "args": ["--stdio"],
+      "languages": { "python": [".py", ".pyi"] },
+      "rootMarkers": ["pyrightconfig.json", "pyproject.toml", "setup.py", ".git"]
+    },
+    {
+      "id": "typescript",
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "languages": { "typescript": [".ts"], "typescriptreact": [".tsx"], "javascript": [".js", ".mjs", ".cjs"], "javascriptreact": [".jsx"] },
+      "rootMarkers": ["tsconfig.json", "jsconfig.json", "package.json"]
+    }
+  ]
+}

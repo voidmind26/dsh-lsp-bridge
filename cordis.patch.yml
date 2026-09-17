@@ -1,0 +1,7 @@
+# web 与 desktop 共用的服务端 Bundle，不声明浏览器组件。
+# 默认不配置语言服务器；安装不会下载或启动任何语言服务器。
+- insert:
+    - id: lsp
+      name: dsh-plugin-lsp
+      config:
+        servers: []

@@ -1,0 +1,29 @@
+# 安装 Bundle 后，将此条目合入目标 profile 的 cordis.patch.yml 顶层数组。
+# 这是已有 lsp 条目的配置覆盖，不要重复 insert；保留其他插件条目。
+# config 整体替换，不是深合并。可同时用于 web 和 desktop profile。
+- id: lsp
+  config:
+    timeoutMs: 30000
+    idleTimeoutMs: 300000
+    maxSessions: 4
+    maxInstances: 8
+    maxFileBytes: 2097152
+    maxOutputChars: 30000
+    servers:
+      - id: go
+        command: gopls
+        args: [serve]
+        languages:
+          go: [.go]
+        rootMarkers: [go.work, go.mod]
+      # 安装对应语言服务器后再启用更多条目。
+      # GUI 的 PATH 可能不同，必要时将 command 改为服务器真实绝对路径。
+      # - id: typescript
+      #   command: typescript-language-server
+      #   args: [--stdio]
+      #   languages:
+      #     typescript: [.ts]
+      #     typescriptreact: [.tsx]
+      #     javascript: [.js, .mjs, .cjs]
+      #     javascriptreact: [.jsx]
+      #   rootMarkers: [tsconfig.json, jsconfig.json, package.json]
