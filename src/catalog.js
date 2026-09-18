@@ -1,7 +1,12 @@
 /**
  * 自动发现使用的固定语言服务器目录。
  *
- * 安装建议仅作为纯文本返回，发现过程不会执行其中的任何命令，也不会修改配置。
+ * 每一项声明三类事实：
+ * - `commands`/`args`：如何在 PATH 或工作区中找到并启动服务器。
+ * - `requires`：服务器除自身之外的运行组件（例如 TypeScript 的 tsserver）。
+ * - `install`：允许插件执行的固定安装方案；命令完全来自本文件，调用方只能选择 id。
+ *
+ * `installAdvice` 始终是纯文本，供人工处理或无法可移植安装时展示。
  */
 export const CATALOG = Object.freeze([
   Object.freeze({
@@ -15,6 +20,7 @@ export const CATALOG = Object.freeze([
         commands: Object.freeze(['gopls']),
         args: Object.freeze([]),
         installAdvice: '安装 Go 后运行：go install golang.org/x/tools/gopls@latest',
+        install: Object.freeze({ kind: 'go', package: 'golang.org/x/tools/gopls', version: 'latest', binary: 'gopls' }),
       }),
     ]),
   }),
@@ -29,6 +35,7 @@ export const CATALOG = Object.freeze([
         commands: Object.freeze(['rust-analyzer']),
         args: Object.freeze([]),
         installAdvice: '使用 rustup 安装：rustup component add rust-analyzer',
+        install: Object.freeze({ kind: 'rustup', component: 'rust-analyzer', binary: 'rust-analyzer', prefix: false }),
       }),
     ]),
   }),
@@ -48,6 +55,19 @@ export const CATALOG = Object.freeze([
         commands: Object.freeze(['typescript-language-server']),
         args: Object.freeze(['--stdio']),
         installAdvice: '使用 npm 安装：npm install --global typescript typescript-language-server',
+        // typescript-language-server 需要 TypeScript SDK 的 tsserver；只找到语言服务器本身
+        // 并不代表可用。TypeScript 7 起不再提供 lib/tsserver.js，因此固定安装 5.x 版本线。
+        requires: Object.freeze([
+          Object.freeze({
+            id: 'typescript-sdk',
+            kind: 'npm-package',
+            name: 'typescript',
+            entry: 'lib/tsserver.js',
+            option: Object.freeze(['tsserver', 'path']),
+            description: 'TypeScript SDK（tsserver）；缺少它时语言服务器会在初始化阶段退出',
+          }),
+        ]),
+        install: Object.freeze({ kind: 'npm', packages: Object.freeze(['typescript@5', 'typescript-language-server']), binary: 'typescript-language-server' }),
       }),
     ]),
   }),
@@ -62,6 +82,7 @@ export const CATALOG = Object.freeze([
         commands: Object.freeze(['pyright-langserver']),
         args: Object.freeze(['--stdio']),
         installAdvice: '使用 npm 安装：npm install --global pyright',
+        install: Object.freeze({ kind: 'npm', packages: Object.freeze(['pyright']), binary: 'pyright-langserver' }),
       }),
     ]),
   }),
@@ -78,7 +99,9 @@ export const CATALOG = Object.freeze([
         id: 'clangd',
         commands: Object.freeze(['clangd']),
         args: Object.freeze([]),
+        // clangd 随 LLVM/Clang 工具链分发，没有可移植的包管理器安装方案。
         installAdvice: '安装 LLVM/Clang 工具链中提供的 clangd；例如 macOS 使用 Homebrew：brew install llvm，Debian/Ubuntu：sudo apt install clangd',
+        install: null,
       }),
     ]),
   }),

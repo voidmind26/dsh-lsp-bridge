@@ -13,40 +13,39 @@ function setup(t, maxSessions = 1) {
   return { pool, managers, call: (session, args = {}) => pool.execute(args, { session, workspace: '/test' }) };
 }
 
-test('空闲过期释放引擎并在下次请求重建', async t => {
-  const { pool, managers, call } = setup(t);
-  const session = {};
-  await call(session);
-  const entry = [...pool.entries][0];
+test('池生命周期：空闲回收与重建、容量回收、活动请求不受回收且满载拒绝', async t => {
+  // 空闲过期后释放引擎，下次请求重建。
+  const idle = setup(t);
+  const idleSession = {};
+  await idle.call(idleSession);
+  const entry = [...idle.pool.entries][0];
   entry.lastUsed = 0;
-  pool.sweep();
+  idle.pool.sweep();
   await entry.closing;
-  assert.equal(managers[0].disposed, true);
-  await call(session);
-  assert.equal(managers.length, 2);
-});
+  assert.equal(idle.managers[0].disposed, true);
+  await idle.call(idleSession);
+  assert.equal(idle.managers.length, 2);
 
-test('池容量满时回收最久空闲会话', async t => {
-  const { managers, call } = setup(t);
-  await call({});
-  await call({});
-  assert.equal(managers.length, 2);
-  assert.equal(managers[0].disposed, true);
-});
+  // 池容量满时回收最久空闲会话。
+  const capacity = setup(t);
+  await capacity.call({});
+  await capacity.call({});
+  assert.equal(capacity.managers.length, 2);
+  assert.equal(capacity.managers[0].disposed, true);
 
-test('活动请求不被空闲回收且满载拒绝新会话', async t => {
-  const { pool, managers, call } = setup(t);
-  const session = {};
-  await call(session);
+  // 活动请求不被空闲回收，且满载时拒绝新会话。
+  const active = setup(t);
+  const activeSession = {};
+  await active.call(activeSession);
   let release;
-  managers[0].execute = () => new Promise(resolve => { release = resolve; });
-  const pending = call(session);
+  active.managers[0].execute = () => new Promise(resolve => { release = resolve; });
+  const pending = active.call(activeSession);
   await Promise.resolve();
-  const entry = [...pool.entries][0];
-  entry.lastUsed = 0;
-  pool.sweep();
-  assert.equal(entry.retired, false);
-  await assert.rejects(call({}), /limit/);
+  const activeEntry = [...active.pool.entries][0];
+  activeEntry.lastUsed = 0;
+  active.pool.sweep();
+  assert.equal(activeEntry.retired, false);
+  await assert.rejects(active.call({}), /limit/);
   release('done');
   assert.equal(await pending, 'done');
 });

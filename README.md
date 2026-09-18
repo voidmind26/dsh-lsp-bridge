@@ -63,10 +63,32 @@ dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 
 该命令面向 Desktop 已创建的现有 profile；不要用它代替首次启动 Desktop 初始化。应用安装路径不同时调整命令。安装后重启 Desktop，再刷新原有 GUI。卸载：`dsh_packaged plugin --profile desktop remove dsh-lsp-bridge`。其他操作系统需使用其 Desktop 提供的 CLI 入口，此处不声明已验证。
 
+### 模型自动安装与配置（推荐）
+
+插件向模型提供 `lsp_setup` 工具，因此**不需要人工扫描或手写配置**。典型流程是让智能体执行一次 `lsp_setup`：
+
+| operation | 行为 | 是否执行程序 |
+| --- | --- | --- |
+| `status` | 诊断项目与服务器，报告缺什么、可用的安装方案 | 否 |
+| `install` | 执行 catalog 允许列表内的安装命令（需 `apply=true`） | 是 |
+| `configure` | 把可用服务器写入插件配置 | 否 |
+| `verify` | 真实启动服务器完成 `initialize`，报告能力与错误 | 是 |
+| `auto` | 串起以上全部步骤（安装需 `apply=true`） | 取决于 `apply` |
+
+它会诊断“服务器存在但运行组件缺失”这类问题。例如只有 `typescript-language-server` 而没有 TypeScript SDK 时，`status` 会给出 `missing-dependency` 与原因，而不是谎报可用；`auto + apply=true` 会把 `typescript@5` 与语言服务器一起装进插件私有目录，并把 `initializationOptions.tsserver.path` 一并写入配置。
+
+安全边界：
+
+- 安装命令完全来自冻结的 `src/catalog.js`，模型只能选择服务器 ID，**不能提供命令、参数、包名或安装路径**。
+- 不使用 shell、不使用 `sudo`；每条命令都会出现在工具调用结果中。
+- 只有 `install`/`auto` 且显式 `apply=true` 才会执行安装；`status` 与 `verify` 从不安装。
+- 安装目录默认 `$DSH_HOME/lsp-bridge`（本机 `~/.dsh/lsp-bridge`），不修改业务工程；可用 `install.directory` 调整，`install.enabled=false` 可整体禁用，`install.managers` 可为某种安装方式指定绝对路径。
+- 每次调用都要求目标会话为 `danger-full-access`，绝不自动提权。C/C++ 的 clangd 没有可移植安装方案，只给出人工安装建议。
+
 ### 配置与启用
 
-1. Bundle 默认 `servers: []`，安装不会下载或启动语言服务器。先安装可信的语言服务器。
-2. 将 `examples/cordis.patch.yml` 的 **`id: lsp` 配置覆盖**合入 `$DSH_HOME/profiles/web/cordis.patch.yml` 或 `$DSH_HOME/profiles/desktop/cordis.patch.yml` 的顶层数组。默认 `DSH_HOME=~/.dsh`。保留其他插件条目；`config` 是整体替换，不是深合并。
+1. Bundle 默认 `servers: []`；安装插件本身不会下载或启动任何语言服务器。推荐直接让智能体执行 `lsp_setup`（见上一节）自动完成，或手工配置。
+2. 手工配置时，将 `examples/cordis.patch.yml` 的 **`id: lsp` 配置覆盖**合入 `$DSH_HOME/profiles/web/cordis.patch.yml` 或 `$DSH_HOME/profiles/desktop/cordis.patch.yml` 的顶层数组。默认 `DSH_HOME=~/.dsh`。保留其他插件条目；`config` 是整体替换，不是深合并。
 3. 根据需要填写 `servers`。GUI 的 PATH 可能与终端不同，必要时使用服务器命令绝对路径。JSON 示例不会自动读取，应把内容放入配置。
 4. 如果以前手动添加过 `insert: ... id: lsp`，迁移时先移除该旧插入，仅保留 Bundle 提供的挂载及 profile 的配置覆盖，避免重复注册工具。
 5. 在目标工程会话中使用 `danger-full-access`，先调用 `lsp` 的 `status`，再查询真实文件中的定义。卸载时同时移除 profile 中仅属于本插件的覆盖条目，并重启相应宿主。
@@ -77,17 +99,25 @@ dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 
 ## 设置 UI 与自动发现
 
-安装并重新加载宿主后，进入「设置 → 插件 → 可配置」，打开 `dsh-lsp-bridge` 卡片：
+安装并完整重启 Desktop（或重新启动 Web 宿主）后，进入「设置 → LSP」独立页面。页面分成两个视图：
 
-1. 选择一个当前活动会话；列表中的目录是服务端会话记录，不接受浏览器提交任意扫描路径。
-2. 点击“扫描当前工作区”。插件检查固定 catalog 中的 Go、Rust、TypeScript/JavaScript、Python 和 C/C++ 项目标记与服务器候选。
-3. 查看可用候选、多候选提示及缺失服务器的安装建议。扫描不会执行候选、版本命令或安装命令，也不会修改工程文件。
-4. 确认信任候选程序后，将建议合入配置编辑器；多候选需要明确选择。可以继续编辑完整 JSON。
-5. 点击保存后，Host 再次校验配置并热替换服务池；保存本身不会启动服务器，下一次语义查询才懒启动。
+**服务器列表（默认）**：只显示当前已配置的每个语言服务器。页面会自动做一次只读诊断，并对齐备的服务器做一次短暂启动验证（`initialize` 后立即关闭），因此每张卡片同时标注**配置状态**（可用 / 缺少运行组件 / 未安装 / 未扫描）与**验证状态**（验证通过 / 验证失败 / 未验证）。点击卡片展开查看该服务器的程序路径、启动参数、语言、项目/工作区目录、初始化选项、验证到的能力或失败原因，以及完整配置；也可用「重新扫描并验证」手动刷新，或一键进入 JSON 编辑。
+
+**语言服务器属于项目目录，不属于会话。** 每台服务器的评估目标由它自己的 `roots`/`workspaceFolders` 决定；没有配置根目录时才回落到当前会话的工作区。因此一台配置在别的工程下的服务器（例如 gopls 指向另一个仓库）同样会得到状态与真实验证，不需要切换到那个项目的会话。卡片里会标注「评估目录：…（来自配置的项目根目录）」。
+
+会话只承担两件事：**授权**（能否启动可信程序）与**未声明根目录时的默认目录**；代码查询（读取工作区文件）仍以会话工作区为边界。
+
+**新增配置（右上角「＋ 新增配置」）**：独立的扫描与编辑视图，完成后点「← 返回服务器列表」。
+
+1. 在新增配置视图中选择一个当前活动会话；列表中的目录是服务端会话记录，不接受浏览器提交任意扫描路径。
+2. 点击“扫描当前工作区”。插件检查固定 catalog 中的 Go、Rust、TypeScript/JavaScript、Python 和 C/C++ 项目标记与服务器候选，并同时诊断运行组件是否齐备。
+3. 查看候选卡片：可用、待选择、未安装、**缺少运行组件**；缺组件时会显示具体原因与将执行的安装命令。扫描不会执行候选、版本命令或安装命令，也不会修改工程文件。
+4. 审阅候选卡片并将可用建议加入配置草稿；多候选需要明确选择。查看服务器摘要，需要手动调整时展开“高级配置”编辑完整 JSON。加入草稿不等于保存。
+5. 核对草稿后点击“保存配置”。Host 再次校验配置并热替换服务池；保存本身不会启动服务器，下一次语义查询才懒启动。保存不需要额外的信任勾选，但请只配置可信的程序路径与参数。
 
 UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现有扫描深度、目录/项目数和时间限制；若结果被截断，界面会明确提示，不能把它当成完整枚举。内置 catalog 以外的语言仍可手工配置。
 
-缺失时只给出命令文本或安装说明，插件不会代替用户运行 `go install`、`npm install`、`rustup`、Homebrew 或系统包管理器。当前发现接口与语言服务器启动一样要求目标会话为 `danger-full-access`，不会自动提权。
+**扫描与安装是两件事：** 扫描只读、永不安装；安装只发生在智能体显式执行 `lsp_setup` 的 `install`/`auto`（且 `apply=true`）时，命令限于 catalog 允许列表，界面上会展示将要执行的确切命令。缺失且无可移植方案时只给出人工安装建议（例如 clangd）。当前发现接口与语言服务器启动一样要求目标会话为 `danger-full-access`，不会自动提权。
 
 ## 通用配置
 
@@ -120,6 +150,14 @@ UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现�
 - 工作区符号只查询选中的一个实例，不自动聚合所有语言和所有项目；明确传入 server + root。
 - Vue SFC、Java、C# 等需要对应服务器及其初始化配置。示例中的 TypeScript 服务不等于完整 Vue `.vue` 支持。
 
+## 模型上下文与服务器选择
+
+插件会向模型注入一段很短的上下文，说明当前会话工作区里配置了哪些语言服务器（名称、语言、最近一次扫描/验证结论），并提示优先用 `lsp` 做代码导航、缺组件时用 `lsp_setup`。该片段在每次装配时**同步**生成，只读内存中的配置与最近一次诊断缓存，不做扫描也不启动进程；没有配置服务器时不注入，缓存 10 分钟过期，最多列出 6 个。
+
+`workspaceSymbols` 没有文件可推断语言，因此插件会先按“是否覆盖当前工作区”自动选择服务器，只有多个服务器都覆盖时才要求显式传 `server`。指定 `server` 时始终按指定服务器查询。
+
+冷启动时插件会先做一次**有界预热**：在服务器项目根目录内（深度 ≤ 2、最多 200 个目录项、最多 24 个语言匹配文件，跳过依赖/构建目录与符号链接）打开匹配文件，让服务器建立项目。这解决了 TypeScript 上 `workspace/symbol` 报 `No Project.` 或返回空结果的问题。预热只在实例还没有任何已打开文档时执行，代价一次。
+
 ## 安全与生命周期
 
 **只暴露只读 LSP 操作，不意味着语言服务器进程被沙箱隔离。** 语言服务器本质上是本地可执行程序，可能读取依赖、写缓存、加载插件或运行工具链。仅配置你信任的程序和项目。
@@ -144,7 +182,7 @@ npm test
 LSP_TEST_GOPLS=/Users/voidmind/go/bin/gopls npm test
 ```
 
-测试覆盖模拟 stdio 分帧、多根与独立项目路由、UTF-16 参数、磁盘内容同步、符号/诊断、路径边界、超时、进程退出、配置与权限门控。真实 gopls 测试默认跳过，设置环境变量才执行。没有为此运行 uos 业务服务或修改其中代码。
+测试按主题组织，**同一主题的断言合并在一个用例里**（当前 42 个用例，覆盖模拟 stdio 分帧、多根与独立项目路由、UTF-16 参数、磁盘内容同步、符号/诊断、路径与符号链接边界、扫描限制与 PATH 处理、配置与权限门控、会话常驻与回收、安装/配置/验证流程、客户端契约与双视图）。新增覆盖请并入对应主题的现有用例，不要为同一行为再开一个用例。真实 gopls 测试默认跳过，设置 `LSP_TEST_GOPLS` 才执行。没有为此运行 uos 业务服务或修改其中代码。
 
 实现入口：`src/index.js`（DSH 适配）、`src/pool.js`（会话常驻池与生命周期）、`src/engine.js`（路由与 LSP 会话）、`src/transport.js`（JSON-RPC stdio）；设计见 `docs/design.md`。
 

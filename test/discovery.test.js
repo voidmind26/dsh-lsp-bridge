@@ -39,7 +39,7 @@ test('固定目录包含五类语言、正确 languageId 和纯文本安装建�
   }
 });
 
-test('发现多个 module、工作区本地命令并形成唯一可用计划', async t => {
+test('项目发现：多 module、唯一可用计划、多候选选择与缺失只给建议', async t => {
   const workspace = await fixture(t);
   const first = await marker(workspace, 'services/a', 'go.mod', 'module a\n');
   const second = await marker(workspace, 'services/b', 'go.mod', 'module b\n');
@@ -54,9 +54,33 @@ test('发现多个 module、工作区本地命令并形成唯一可用计划', a
   assert.equal(result.plans[0].status, 'ready');
   assert.equal(result.plans[0].command, command);
   assert.deepEqual(result.plans[0].roots, [first, second].sort());
+
+  const choiceWorkspace = await fixture(t);
+  const firstBin = path.join(choiceWorkspace, 'bin-one');
+  const secondBin = path.join(choiceWorkspace, 'bin-two');
+  await marker(choiceWorkspace, 'web', 'package.json', '{}');
+  const firstCandidate = await executable(path.join(firstBin, 'typescript-language-server'));
+  const secondCandidate = await executable(path.join(secondBin, 'typescript-language-server'));
+
+  const choice = await discoverWorkspace({
+    workspace: choiceWorkspace,
+    env: { PATH: `${firstBin}${path.delimiter}${secondBin}` },
+    languages: ['tsjs'],
+  });
+  assert.equal(choice.plans[0].status, 'needs-choice');
+  assert.equal(Object.hasOwn(choice.plans[0], 'command'), false);
+  assert.deepEqual(choice.plans[0].candidates, [firstCandidate, secondCandidate].sort());
+  assert.ok(choice.plans[0].candidates.every(candidate => choice.executables.some(item => item.path === candidate)));
+
+  const missingWorkspace = await fixture(t);
+  await marker(missingWorkspace, 'native', 'CMakeLists.txt');
+  const missing = await discoverWorkspace({ workspace: missingWorkspace, env: { PATH: '' }, platform: 'win32', languages: ['cpp'] });
+  assert.equal(missing.plans[0].status, 'missing');
+  assert.equal(typeof missing.plans[0].installAdvice, 'string');
+  assert.equal(Object.hasOwn(missing.plans[0], 'command'), false);
 });
 
-test('跳过构建目录、依赖目录以及目录符号链接', async t => {
+test('扫描不跟随目录符号链接，marker 必须是普通文件', async t => {
   const workspace = await fixture(t);
   const outside = await fixture(t);
   await marker(workspace, 'src/real', 'Cargo.toml');
@@ -74,20 +98,18 @@ test('跳过构建目录、依赖目录以及目录符号链接', async t => {
 
   const result = await discoverWorkspace({ workspace, env: { PATH: '' }, languages: ['rust'] });
   assert.deepEqual(result.projects.map(item => path.relative(workspace, item.root)), ['src/real']);
+
+  const markerWorkspace = await fixture(t);
+  const markerOutside = await fixture(t);
+  await mkdir(path.join(markerWorkspace, 'directory/go.mod'), { recursive: true });
+  await writeFile(path.join(markerOutside, 'go.mod'), 'module escaped\n');
+  await mkdir(path.join(markerWorkspace, 'linked'), { recursive: true });
+  await symlink(path.join(markerOutside, 'go.mod'), path.join(markerWorkspace, 'linked/go.mod'));
+  const markerResult = await discoverWorkspace({ workspace: markerWorkspace, env: { PATH: '' }, languages: ['go'] });
+  assert.deepEqual(markerResult.projects, []);
 });
 
-test('marker 必须是普通文件，拒绝目录和符号链接', async t => {
-  const workspace = await fixture(t);
-  const outside = await fixture(t);
-  await mkdir(path.join(workspace, 'directory/go.mod'), { recursive: true });
-  await writeFile(path.join(outside, 'go.mod'), 'module escaped\n');
-  await mkdir(path.join(workspace, 'linked'), { recursive: true });
-  await symlink(path.join(outside, 'go.mod'), path.join(workspace, 'linked/go.mod'));
-  const result = await discoverWorkspace({ workspace, env: { PATH: '' }, languages: ['go'] });
-  assert.deepEqual(result.projects, []);
-});
-
-test('忽略 PATH 相对段，只接受 canonical 绝对普通可执行文件并去重', async t => {
+test('PATH 处理：忽略相对段、canonical 去重、128 目录上限与 Windows 包装器', async t => {
   const workspace = await fixture(t);
   const bin = path.join(workspace, 'tools');
   await marker(workspace, 'app', 'pyproject.toml');
@@ -103,58 +125,26 @@ test('忽略 PATH 相对段，只接受 canonical 绝对普通可执行文件并
   });
   assert.deepEqual(result.executables.map(item => item.path), [canonical]);
   assert.ok(result.executables.every(item => path.isAbsolute(item.path)));
-});
 
-test('PATH 最多采用 128 个绝对目录并报告截断', async t => {
-  const workspace = await fixture(t);
-  await marker(workspace, 'app', 'pyrightconfig.json');
-  const directories = Array.from({ length: 129 }, (_, index) => path.join(workspace, `bin-${index}`));
+  const cappedWorkspace = await fixture(t);
+  await marker(cappedWorkspace, 'app', 'pyrightconfig.json');
+  const directories = Array.from({ length: 129 }, (_, index) => path.join(cappedWorkspace, `bin-${index}`));
   await executable(path.join(directories[128], 'pyright-langserver'));
-  const result = await discoverWorkspace({ workspace, env: { PATH: directories.join(path.delimiter) }, languages: ['python'] });
-  assert.ok(result.truncationReasons.includes('maxPathDirectories'));
-  assert.deepEqual(result.executables, []);
+  const capped = await discoverWorkspace({ workspace: cappedWorkspace, env: { PATH: directories.join(path.delimiter) }, languages: ['python'] });
+  assert.ok(capped.truncationReasons.includes('maxPathDirectories'));
+  assert.deepEqual(capped.executables, []);
+
+  const windowsWorkspace = await fixture(t);
+  const windowsBin = path.join(windowsWorkspace, 'bin');
+  await marker(windowsWorkspace, 'web', 'package.json', '{}');
+  await executable(path.join(windowsBin, 'typescript-language-server.cmd'));
+  await executable(path.join(windowsBin, 'typescript-language-server.bat'));
+  const windows = await discoverWorkspace({ workspace: windowsWorkspace, env: { PATH: windowsBin }, platform: 'win32', languages: ['tsjs'] });
+  assert.deepEqual(windows.executables, []);
+  assert.equal(windows.plans[0].status, 'missing');
 });
 
-test('Windows 不把 cmd/bat 包装器视为可直接执行候选', async t => {
-  const workspace = await fixture(t);
-  const bin = path.join(workspace, 'bin');
-  await marker(workspace, 'web', 'package.json', '{}');
-  await executable(path.join(bin, 'typescript-language-server.cmd'));
-  await executable(path.join(bin, 'typescript-language-server.bat'));
-  const result = await discoverWorkspace({ workspace, env: { PATH: bin }, platform: 'win32', languages: ['tsjs'] });
-  assert.deepEqual(result.executables, []);
-  assert.equal(result.plans[0].status, 'missing');
-});
-
-test('多个可执行候选要求选择且 command 只来自发现结果', async t => {
-  const workspace = await fixture(t);
-  const firstBin = path.join(workspace, 'bin-one');
-  const secondBin = path.join(workspace, 'bin-two');
-  await marker(workspace, 'web', 'package.json', '{}');
-  const first = await executable(path.join(firstBin, 'typescript-language-server'));
-  const second = await executable(path.join(secondBin, 'typescript-language-server'));
-
-  const result = await discoverWorkspace({
-    workspace,
-    env: { PATH: `${firstBin}${path.delimiter}${secondBin}` },
-    languages: ['tsjs'],
-  });
-  assert.equal(result.plans[0].status, 'needs-choice');
-  assert.equal(Object.hasOwn(result.plans[0], 'command'), false);
-  assert.deepEqual(result.plans[0].candidates, [first, second].sort());
-  assert.ok(result.plans[0].candidates.every(candidate => result.executables.some(item => item.path === candidate)));
-});
-
-test('缺失命令只给出安装建议，不伪造 command', async t => {
-  const workspace = await fixture(t);
-  await marker(workspace, 'native', 'CMakeLists.txt');
-  const result = await discoverWorkspace({ workspace, env: { PATH: '' }, platform: 'win32', languages: ['cpp'] });
-  assert.equal(result.plans[0].status, 'missing');
-  assert.equal(typeof result.plans[0].installAdvice, 'string');
-  assert.equal(Object.hasOwn(result.plans[0], 'command'), false);
-});
-
-test('深度、目录数与项目数限制产生明确截断原因', async t => {
+test('扫描限制：截断原因、硬上限与 AbortSignal', async t => {
   const depthWorkspace = await fixture(t);
   await marker(depthWorkspace, 'a/b', 'go.mod');
   const depth = await discoverWorkspace({ workspace: depthWorkspace, env: { PATH: '' }, languages: ['go'], limits: { maxDepth: 1 } });
@@ -174,20 +164,18 @@ test('深度、目录数与项目数限制产生明确截断原因', async t => 
   const projects = await discoverWorkspace({ workspace: projectWorkspace, env: { PATH: '' }, languages: ['go'], limits: { maxProjects: 1 } });
   assert.ok(projects.truncationReasons.includes('maxProjects'));
   assert.equal(projects.projects.length, 1);
-});
 
-test('限制存在硬上限且支持 AbortSignal', async t => {
-  const workspace = await fixture(t);
-  await assert.rejects(discoverWorkspace({ workspace, limits: { maxDepth: 33 } }), /maxDepth/);
-  await assert.rejects(discoverWorkspace({ workspace, limits: { maxDirectories: 100001 } }), /maxDirectories/);
-  await assert.rejects(discoverWorkspace({ workspace, limits: { maxProjects: 4097 } }), /maxProjects/);
-  await assert.rejects(discoverWorkspace({ workspace, limits: { deadlineMs: 30001 } }), /deadlineMs/);
+  const limitsWorkspace = await fixture(t);
+  await assert.rejects(discoverWorkspace({ workspace: limitsWorkspace, limits: { maxDepth: 33 } }), /maxDepth/);
+  await assert.rejects(discoverWorkspace({ workspace: limitsWorkspace, limits: { maxDirectories: 100001 } }), /maxDirectories/);
+  await assert.rejects(discoverWorkspace({ workspace: limitsWorkspace, limits: { maxProjects: 4097 } }), /maxProjects/);
+  await assert.rejects(discoverWorkspace({ workspace: limitsWorkspace, limits: { deadlineMs: 30001 } }), /deadlineMs/);
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(discoverWorkspace({ workspace, signal: controller.signal }), error => error.name === 'AbortError');
+  await assert.rejects(discoverWorkspace({ workspace: limitsWorkspace, signal: controller.signal }), error => error.name === 'AbortError');
 });
 
-test('工作区先 realpath，扫描结果不逃逸工作区', async t => {
+test('扫描边界：工作区 realpath 不逃逸，且实现不引入 child_process', async t => {
   const parent = await fixture(t);
   const actual = await marker(parent, 'actual/project', 'go.mod');
   const alias = path.join(parent, 'alias');
@@ -198,9 +186,7 @@ test('工作区先 realpath，扫描结果不逃逸工作区', async t => {
     const relative = path.relative(path.join(parent, 'actual'), project.root);
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
   }));
-});
 
-test('自动发现实现不导入 child_process，因而不会 spawn 或执行版本命令', async () => {
   const source = await readFile(fileURLToPath(new URL('../src/discovery.js', import.meta.url)), 'utf8');
   assert.doesNotMatch(source, /node:child_process|from\s+['"]child_process['"]|\bspawn\s*\(|\bexec(?:File)?\s*\(/);
   assert.doesNotMatch(source, /--version|\swhich\s/);

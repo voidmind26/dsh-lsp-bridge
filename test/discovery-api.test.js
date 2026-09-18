@@ -27,7 +27,7 @@ function host({ workspace, mode = 'danger-full-access' }) {
 
 async function body(response) { return response.json(); }
 
-test('发现 API 注册同一路径 GET/POST，并把 cwd 绑定到活动会话', async () => {
+test('发现 API：GET/POST 注册、会话绑定、权限门控与请求体校验', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'dsh-lsp-api-'));
   try {
     await writeFile(join(workspace, 'go.mod'), 'module example.test/api\n');
@@ -45,14 +45,15 @@ test('发现 API 注册同一路径 GET/POST，并把 cwd 绑定到活动会话'
       body: JSON.stringify({ sessionId: 'session-1', languages: ['go'], refresh: true }),
     }));
     assert.equal(discovered.status, 200);
-    assert.equal((await body(discovered)).projects[0].root, await realpath(workspace));
+    const payload = await body(discovered);
+    assert.equal(payload.projects[0].root, await realpath(workspace));
+    // 只读诊断必须同时给出运行组件状态与安装计划，但不执行任何命令。
+    assert.equal(payload.servers[0].serverId, 'gopls');
+    assert.ok(Array.isArray(payload.servers[0].dependencies));
+    assert.ok(payload.servers[0].install.available === true || typeof payload.servers[0].install.reason === 'string');
+    assert.equal(typeof payload.install.directory, 'string');
     await Promise.all(cleanups.map(cleanup => cleanup()));
-  } finally { await rm(workspace, { recursive: true, force: true }); }
-});
 
-test('发现 API 拒绝伪造 cwd/command、错误媒体类型与非 DFA 会话', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'dsh-lsp-api-'));
-  try {
     const allowed = host({ workspace });
     const extra = await allowed.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -62,6 +63,18 @@ test('发现 API 拒绝伪造 cwd/command、错误媒体类型与非 DFA 会话'
     assert.match(JSON.stringify(await body(extra)), /invalid-request/);
     const media = await allowed.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, { method: 'POST', body: '{}' }));
     assert.equal(media.status, 415);
+    // verify 必须是布尔值；默认（未传）不做任何启动验证。
+    const badVerify = await allowed.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-1', verify: 'yes' }),
+    }));
+    assert.equal(badVerify.status, 400);
+    const noVerify = await allowed.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-1', verify: false }),
+    }));
+    assert.equal(noVerify.status, 200);
+    assert.equal('verification' in await body(noVerify), false, '默认响应不包含验证结果，也不启动服务器');
 
     const restricted = host({ workspace, mode: 'workspace-write' });
     const denied = await restricted.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
