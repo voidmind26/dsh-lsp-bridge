@@ -324,6 +324,7 @@ window.__ModuleLoader__.load({
         !parsed.error && servers.length
           ? h('div', { className: 'lsp-grid' }, servers.map(serverCard))
           : !parsed.error ? h('p', { className: 'lsp-empty lsp-muted' }, '尚未配置语言服务器。点击右上角「＋ 新增配置」扫描工作区，或直接写入 JSON。') : null,
+        report?.verificationRefused ? h('p', { className: 'lsp-alert lsp-warning', role: 'status' }, `验证未执行：${report.verificationRefused.message}`) : null,
         servers.length ? h('p', { className: 'lsp-muted' }, '每台服务器的评估目录由它自己的项目根目录决定（没有配置根目录时才用当前会话工作区）；因此验证不依赖某个会话，扫描一次即可覆盖不同项目的服务器。') : null);
 
       /** 新增/编辑视图：扫描、候选审阅与完整 JSON。 */
@@ -341,6 +342,7 @@ window.__ModuleLoader__.load({
         h('section', { className: 'lsp-section', key: 'candidates' },
           step('2', '候选审阅', '检查程序路径、运行组件与项目范围。缺组件的服务器可以让智能体自动安装并写回配置。'),
           report ? h('fieldset', { disabled: busy, style: { border: 0, padding: 0, margin: 0, minWidth: 0 } }, h('legend', { className: 'lsp-muted', style: { marginBottom: 12 } }, '语言服务器候选'), h(DiscoveryReport, { report, choices, verification, onChoose: (key, value) => { setChoices(previous => ({ ...previous, [key]: value })); } })) : h('p', { className: 'lsp-empty lsp-muted' }, '尚未扫描。扫描完成后，可用服务器与待选择的程序会显示在这里。'),
+          report?.verificationRefused ? h('p', { className: 'lsp-alert lsp-warning', role: 'status' }, `验证未执行：${report.verificationRefused.message}`) : null,
           report ? h('div', { className: 'lsp-inset' },
             h('p', { className: 'lsp-muted' }, '按服务器 id 合并：保留其他服务器；同 id 的程序、参数、语言与项目根配置会被建议覆盖，其余字段保留。也可在会话中让智能体调用 lsp_setup 自动完成安装、配置与验证。'),
             h('div', { className: 'lsp-row' }, h('p', { className: 'lsp-muted' }, `${selectedCount} 项建议可加入 · 加入后仍需保存`),

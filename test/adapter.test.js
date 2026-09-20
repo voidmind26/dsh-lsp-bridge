@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { apply, validateArgs, validateConfig, Config, SETTINGS_NAMESPACE } from '../src/index.js';
 
 test('配置校验、Standard Schema 契约与 settings 热替换', async () => {
@@ -55,20 +59,42 @@ test('工具注册：受限会话按沙箱可用性放行或失败关闭、全�
   await assert.rejects(tool.execute({ operation: 'status' }, { agent: { session: { header: { cwd: process.cwd() } } } }), /sandbox backend/);
   await cleanup();
 
-  // 提供沙箱服务后，受限会话可以执行只读操作（进程启动由 confine 包装）。
+  // 提供沙箱服务后，受限会话可以执行真正启动进程的操作，且 argv 必须经过沙箱包装。
+  // 这里刻意用会 spawn 的 hover：只查 status 不会启动进程，也就发现不了“沙箱参数没传下去”。
   let confinedTool, confinedCleanup;
+  const wrapped = [];
+  const policies = [];
   const confinedCtx = {
     tools: { register: value => { if (value.name === 'lsp') confinedTool = value; } },
-    sandboxPolicy: { resolve: () => ({ mode: 'workspace-write' }) },
+    sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: process.cwd() }) },
     effect: factory => { confinedCleanup = factory(); },
     inject: (services, callback) => {
-      if (services.includes('sandbox')) callback({ sandbox: { confine: argv => argv } });
+      if (services.includes('sandbox')) callback({
+        sandbox: {
+          confine: (argv, policy) => {
+            if (policy === undefined) throw new TypeError('confine 缺少 policy 参数');
+            wrapped.push(argv);
+            policies.push(policy.mode);
+            // 真实沙箱服务返回 { argv, enforcement, ... }（见 @deepseek-ai/dsh-sandbox）。
+            return { argv: ['/usr/bin/env', ...argv], enforcement: 'full' };
+          },
+        },
+      });
     },
   };
-  apply(confinedCtx, { servers: [{ id: 'sample', command: 'not-started', languages: { example: ['.example'] } }] });
-  const confined = await confinedTool.execute({ operation: 'status' }, { agent: { session: { header: { cwd: process.cwd() } } } });
-  assert.equal(JSON.parse(confined.json).servers[0].id, 'sample');
-  await confinedCleanup();
+  const script = fileURLToPath(new URL('./mock-server.js', import.meta.url));
+  const confinedWorkspace = await mkdtemp(join(tmpdir(), 'dsh-lsp-adapter-'));
+  await writeFile(join(confinedWorkspace, 'a.mock'), 'hello');
+  apply(confinedCtx, { servers: [{ id: 'sample', command: process.execPath, args: [script], languages: { mock: ['.mock'] }, rootMarkers: [] }] });
+  try {
+    const confined = await confinedTool.execute({ operation: 'hover', file: 'a.mock', line: 1, character: 1 }, { agent: { session: { header: { cwd: confinedWorkspace } } } });
+    assert.match(JSON.parse(confined.json).contents.value, /hello/, '包装后的 argv 确实被用于启动服务器');
+    assert.deepEqual(wrapped[0], [process.execPath, script], 'confine 收到完整 argv');
+    assert.equal(policies[0], 'workspace-write', 'confine 必须拿到会话 policy');
+  } finally {
+    await confinedCleanup();
+    await rm(confinedWorkspace, { recursive: true, force: true });
+  }
 
   let fullTool, fullCleanup;
   const fullCtx = {

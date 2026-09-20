@@ -1,4 +1,9 @@
 import { pathToFileURL } from 'node:url';
+import { appendFileSync } from 'node:fs';
+const flag = name => process.argv.find(value => value.startsWith(`--${name}=`))?.slice(name.length + 3);
+const recordOpens = flag('record-opens');
+const editTarget = flag('edit-target');
+let pendingInitialize = null;
 let buffer = Buffer.alloc(0);
 const documents = new Map();
 let initialization;
@@ -10,13 +15,29 @@ function send(message) {
   process.stdout.write(wire.subarray(9));
 }
 function handle(m) {
+  // 客户端对 workspace/applyEdit 的响应到达后，才回复 initialize（确定性屏障）。
+  if (m.id === 9001 && pendingInitialize !== null) {
+    const id = pendingInitialize;
+    pendingInitialize = null;
+    send({ jsonrpc: '2.0', id, result: { capabilities: { textDocumentSync: 1 } } });
+    return;
+  }
   let result = null;
   if (m.method === 'initialize') {
     initialization = m.params;
+    // --edit-target=<path>：初始化阶段就主动请求客户端应用一次编辑。
+    // 在收到该请求的响应之前不回复 initialize，测试因此有确定性屏障，不需要 sleep。
+    if (editTarget) {
+      pendingInitialize = m.id;
+      send({ jsonrpc: '2.0', id: 9001, method: 'workspace/applyEdit', params: { edit: { changes: { [pathToFileURL(editTarget).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } }, newText: 'SERVER EDIT' }] } } } });
+      setTimeout(() => { if (pendingInitialize !== null) { send({ jsonrpc: '2.0', id: pendingInitialize, result: { capabilities: { textDocumentSync: 1 } } }); pendingInitialize = null; } }, 2000).unref?.();
+      return;
+    }
     result = { capabilities: { positionEncoding: 'utf-16', textDocumentSync: 1, hoverProvider: true, definitionProvider: true, referencesProvider: true, documentSymbolProvider: true, workspaceSymbolProvider: true, diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } } };
     if (process.argv.includes('--push')) delete result.capabilities.diagnosticProvider;
   } else if (m.method === 'textDocument/didOpen') {
     documents.set(m.params.textDocument.uri, m.params.textDocument.text);
+    if (recordOpens) appendFileSync(recordOpens, `${m.params.textDocument.uri}\n`);
     if (process.argv.includes('--push')) setTimeout(() => send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: m.params.textDocument.uri, version: 1, diagnostics: [{ message: 'push diagnostic', severity: 2, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }] } }), 30);
   }
   else if (m.method === 'textDocument/didChange') documents.set(m.params.textDocument.uri, m.params.contentChanges.at(-1).text);

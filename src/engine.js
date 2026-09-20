@@ -1,8 +1,8 @@
-import { realpath, stat, open, opendir, writeFile } from 'node:fs/promises';
+import { chmod, lstat, realpath, stat, open, opendir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { LspTransport, abortError } from './transport.js';
-import { applyTextEdits, assertWriteAllowed, editForSingleFile, normalizeWorkspaceEdit, pathFromUri } from './edits.js';
+import { applyResolvedEdits, assertWriteAllowed, editForSingleFile, normalizeWorkspaceEdit, pathFromUri, previewResolvedEdits, resolveTextEdits } from './edits.js';
 
 const METHODS = {
   hover: 'textDocument/hover', definition: 'textDocument/definition', references: 'textDocument/references',
@@ -22,6 +22,8 @@ const WARMUP_MAX_FILES = 24;
 const inside = (base, target) => { const rel = path.relative(base, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); };
 const checkAbort = signal => { if (signal?.aborted) throw abortError(); };
 const uriFor = file => pathToFileURL(file).href;
+/** 只按扩展名边界匹配，避免 'bigmock' 被 'mock' 命中（与 language() 同一口径）。 */
+const matchesExtension = (name, extension) => name === extension || name.endsWith(extension.startsWith('.') ? extension : `.${extension}`);
 // Retain at most 1 MiB of diagnostics per URI and 128 URIs per instance.
 function boundedDiagnostics(items) {
   const result = [];
@@ -103,7 +105,7 @@ export class LspManager {
   language(server, file) {
     if (!file) return null;
     for (const [id, extensions] of Object.entries(server.languages)) {
-      if (extensions.some(ext => path.basename(file) === ext || file.endsWith(ext.startsWith('.') ? ext : `.${ext}`))) return id;
+      if (extensions.some(extension => matchesExtension(path.basename(file), extension))) return id;
     }
     return null;
   }
@@ -199,7 +201,7 @@ export class LspManager {
         if (!entry.isFile()) continue;
         // 同一个目录里的文件未必互相引用（推断项目按文件/目录划分），因此把匹配文件都打开，
         // 而不是只取一个；总量由 WARMUP_MAX_FILES 限制。
-        if (extensions.some(extension => entry.name.endsWith(extension))) files.push(target);
+        if (extensions.some(extension => matchesExtension(entry.name, extension))) files.push(target);
       }
     }
     return files;
@@ -213,13 +215,22 @@ export class LspManager {
     if (instance.documents.size > 0) return 0;
     const candidates = await this.warmupFiles(server, instance.root, signal);
     let opened = 0;
-    for (const [index, candidate] of candidates.entries()) {
-      const text = await this.readDocument(workspace, candidate);
+    let barrierSent = false;
+    for (const candidate of candidates) {
+      checkAbort(signal);
+      let text;
+      try {
+        text = await this.readDocument(workspace, candidate);
+      } catch (error) {
+        // 预热是尽力而为：单个文件过大或不可读时跳过，不能让整次查询失败。
+        if (signal?.aborted) throw error;
+        continue;
+      }
       checkAbort(signal);
       const uri = this.syncDocument(instance, candidate, this.language(server, candidate), text);
-      // 打开文件之外还要等服务器真正处理完并建立项目，否则工作区符号可能得到空结果；
-      // 这里只对首个文件发一次请求，其余文件靠 didOpen 计入项目。
-      if (index === 0) {
+      // 只对首个成功打开的文件发一次真实请求，让服务器建立项目；其余靠 didOpen 计入。
+      if (!barrierSent) {
+        barrierSent = true;
         try { await instance.transport.request('textDocument/documentSymbol', { textDocument: { uri } }, { signal }); }
         catch (error) { if (signal?.aborted) throw error; /* 预热失败不阻断后续查询 */ }
       }
@@ -246,7 +257,7 @@ export class LspManager {
       instance.transport = new LspTransport({ ...server, cwd: root, timeoutMs: this.timeoutMs, confine: this.confine,
         env: { ...(this.sandboxEnv ?? {}), ...(server.env ?? {}) },
         onRequest: (method, params) => {
-          if (method === 'workspace/applyEdit') return this.applyServerEdit(params?.edit, workspace, signal);
+          if (method === 'workspace/applyEdit') return this.applyServerEdit(params?.edit, workspace);
           if (method === 'workspace/workspaceFolders') return workspaceFolders;
           if (method === 'workspace/configuration') return (params?.items || []).map(item => {
             if (!item.section) return server.settings ?? {};
@@ -302,39 +313,65 @@ export class LspManager {
    */
   async applyEdit({ edit, workspace, signal, dryRun }) {
     const files = normalizeWorkspaceEdit(edit);
-    const planned = [];
+    // 按解析后的真实路径分组：同一文件的不同 URI 拼写（大小写、%2F 等）必须合成一次写入，
+    // 否则两条记录各自基于原文计算，后写会覆盖前写并静默丢编辑。
+    const grouped = new Map();
     for (const entry of files) {
       checkAbort(signal);
       const file = pathFromUri(entry.uri);
       if (file === null) throw new Error(`无法解析目标文件 URI：${entry.uri}`);
-      // 先判权限（只读会话要给出“需要完全访问权限”的明确提示），再判工作区边界。
       assertWriteAllowed({ mode: this.writeMode, workspace, file });
       let checked;
       try {
         checked = await safePath(workspace, file);
-      } catch {
-        throw new Error(`目标文件不在会话工作区内：${file}。插件只在会话工作区内应用语言服务器的编辑。`);
+      } catch (error) {
+        // 区分“文件不存在”与“越界/无法解析”，避免把 ENOENT 说成权限问题。
+        if (String(error?.message ?? '').includes('ENOENT')) throw new Error(`目标文件不存在：${file}`);
+        throw new Error(`目标文件不在会话工作区内或无法解析：${file}。插件只在会话工作区内应用语言服务器的编辑。`);
       }
-      const text = await this.readDocument(workspace, checked);
-      const next = applyTextEdits(text, entry.edits);
-      planned.push({ uri: entry.uri, file: checked, edits: entry.edits.length, changed: next !== text, next });
+      grouped.set(checked, { uri: entry.uri, edits: [...(grouped.get(checked)?.edits ?? []), ...entry.edits] });
     }
-    if (dryRun) return { applied: false, dryRun: true, files: planned.map(({ uri, file, edits, changed }) => ({ uri, file, edits, changed })) };
+    const planned = [];
+    for (const [file, entry] of grouped) {
+      checkAbort(signal);
+      const text = await this.readDocument(workspace, file);
+      const resolved = resolveTextEdits(text, entry.edits);
+      const next = applyResolvedEdits(text, resolved);
+      planned.push({
+        uri: entry.uri, file, edits: entry.edits.length, changed: next !== text, next,
+        // dry-run 必须给出将要改动的内容，“先预览后写入”才有意义。
+        preview: previewResolvedEdits(resolved),
+      });
+    }
+    const summary = planned.map(({ uri, file, edits, changed, preview }) => ({ uri, file, edits, changed, ...(dryRun ? { preview } : {}) }));
+    if (dryRun) return { applied: false, dryRun: true, files: summary };
+    // 全部文件先读完并算出新内容，再逐个原子替换；中途失败会说明已经写了哪些文件，
+    // 不假装整批成功，也不留下半截文件。
+    const written = [];
     for (const item of planned) {
       checkAbort(signal);
-      if (item.changed) await writeFile(item.file, item.next);
+      if (!item.changed) continue;
+      try {
+        await writeFileAtomic(item.file, item.next);
+        written.push(item.file);
+      } catch (error) {
+        error.writtenFiles = written;
+        error.message = `${error.message}（已写入 ${written.length} 个文件，剩余未写入：${planned.filter(entry => entry.changed && !written.includes(entry.file)).map(entry => entry.file).join('、') || '无'}）`;
+        throw error;
+      }
     }
-    return { applied: true, dryRun: false, files: planned.map(({ uri, file, edits, changed }) => ({ uri, file, edits, changed })) };
+    return { applied: planned.some(item => item.changed), dryRun: false, files: summary };
   }
 
   /** 服务器主动请求应用编辑（例如代码动作）；失败原因会回传给服务器。 */
-  async applyServerEdit(edit, workspace, signal) {
+  async applyServerEdit(edit, workspace) {
     try {
-      const result = await this.applyEdit({ edit, workspace, signal, dryRun: false });
+      // 不使用创建实例那次请求的 signal：它可能在首次调用结束时已被 abort，
+      // 导致后续合法的服务器编辑被误判为“请求已取消”。
+      const result = await this.applyEdit({ edit, workspace, signal: undefined, dryRun: false });
       return { applied: result.files.some(item => item.changed) };
     } catch (error) {
       // 只读或工作区外被拒时，把“需要完全访问权限”的原因如实回传。
-      if (signal?.aborted) return { applied: false, failureReason: 'LSP request aborted' };
       return { applied: false, failureReason: error.message };
     }
   }
@@ -502,8 +539,12 @@ export class LspManager {
       if (!isWrite) return response;
       // 格式化的返回是 TextEdit[]，重命名返回 WorkspaceEdit；统一按 WorkspaceEdit 应用。
       const edit = operation === 'format' ? editForSingleFile(uri, response) : response;
-      if (edit === null || edit === undefined) return { applied: false, dryRun: input.apply !== true, files: [] };
-      const applied = await this.applyEdit({ edit, workspace, signal, dryRun: input.apply !== true });
+      const dryRun = input.apply !== true;
+      // 空编辑与 null 保持同一种形状，模型才能区分“服务器没给编辑 / 没有改动 / 已写入”。
+      if (edit === null || edit === undefined) {
+        return { operation, applied: false, dryRun, files: [], reason: '语言服务器没有返回任何编辑（可能不支持该操作，或没有可改动的内容）。' };
+      }
+      const applied = await this.applyEdit({ edit, workspace, signal, dryRun });
       return { operation, ...applied };
     }, signal);
   }
@@ -524,8 +565,41 @@ export class LspManager {
  * 用于安装后验证“能找到程序”确实等于“能工作”；不保留任何常驻实例。
  * 失败时抛出包含服务器 stderr 的错误，便于直接展示原因。
  */
+/**
+ * 同目录临时文件 + rename 的原子替换：避免写到一半失败把源文件截断。
+ * 保留原文件权限；失败时清理临时文件。
+ */
+async function writeFileAtomic(file, text) {
+  // 只有普通文件才写：目录、设备、FIFO 一律拒绝（safePath 已解析掉符号链接）。
+  const info = await lstat(file);
+  if (!info.isFile()) throw new Error(`拒绝写入非普通文件：${file}`);
+  const mode = info.mode & 0o777;
+  let temporary;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const candidate = `${file}.dsh-lsp-${process.pid}-${Math.random().toString(36).slice(2, 10)}.tmp`;
+    try {
+      // O_CREAT|O_EXCL：不跟随任何已存在的同名文件（含符号链接）。
+      await writeFile(candidate, text, { mode, flag: 'wx' });
+      temporary = candidate;
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+  if (temporary === undefined) throw new Error(`无法创建临时文件：${file}`);
+  try {
+    // writeFile 的 mode 会被 umask 收紧，这里显式补回原权限。
+    await chmod(temporary, mode);
+    await rename(temporary, file);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 export async function probeLanguageServer({ server, workspace, root, timeoutMs = 15000, signal, confine, env } = {}) {
-  const manager = new LspManager({ servers: [server], timeoutMs, maxInstances: 1, confine, sandboxEnv: env });
+  // 探针只做 initialize 验证：writeMode 固定为 deny，服务器即使请求 applyEdit 也不会改文件。
+  const manager = new LspManager({ servers: [server], timeoutMs, maxInstances: 1, confine, sandboxEnv: env, writeMode: 'deny' });
   try {
     const parsed = manager.servers[0];
     const resolved = await manager.rootFor(parsed, workspace, undefined, root === undefined ? undefined : root);

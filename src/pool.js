@@ -36,14 +36,15 @@ export function sandboxEnvironment(config, { env = process.env } = {}) {
 export class LspSessionPool {
   constructor(config, resolvePolicy, options = {}) {
     // 旧签名把 createManager 作为第三个位置参数；保持兼容，避免调用方被迫改写。
-    const { createManager = value => new LspManager(value), confine = null, sandbox = null, hasSandbox = null } = typeof options === 'function' ? { createManager: options } : options;
+    const { createManager = value => new LspManager(value), sandboxConfine = null, sandbox = null, hasSandbox = null } = typeof options === 'function' ? { createManager: options } : options;
     this.config = config;
     this.resolvePolicy = resolvePolicy;
     this.createManager = createManager;
-    // 沙箱服务的 confine(argv, policy) 包装函数；缺少它时受限会话失败关闭。
-    this.confine = confine;
+    // 直接持有沙箱服务的方法：confine(argv, policy) → { argv, enforcement, … }（DSH 沙箱契约）。
+    // 解包只在这里做一次，避免调用链上出现“谁负责 .argv”的双重契约。
+    this.sandboxConfine = sandboxConfine;
     // 沙箱服务按需加载，因此用谓词判断“现在是否真的可用”，不可用时失败关闭。
-    this.hasSandbox = typeof hasSandbox === 'function' ? hasSandbox : () => typeof confine === 'function';
+    this.hasSandbox = typeof hasSandbox === 'function' ? hasSandbox : () => typeof sandboxConfine === 'function';
     this.sandboxConfig = sandbox ?? normalizeSandboxConfig({});
     this.entries = new Set();
     this.closedSessions = new WeakSet();
@@ -70,13 +71,24 @@ export class LspSessionPool {
     }
     // 写入模式与会话权限一致：完全访问不额外限制；workspace-write 只允许工作区内；read-only 拒绝写入。
     const writeMode = policy?.mode === 'danger-full-access' ? 'full' : policy?.mode === 'read-only' ? 'deny' : 'workspace';
+    // 绑定已解析的 policy：沙箱服务需要它来生成 profile（mode/workspaceRoot），
+    // 而 transport 调用 confine 时只有 argv 一个参数。
+    const confineArgv = argv => {
+      const result = this.sandboxConfine(argv, policy);
+      const wrapped = result?.argv;
+      if (!Array.isArray(wrapped) || wrapped.length === 0 || wrapped.some(item => typeof item !== 'string' || !item)) {
+        throw new Error('沙箱服务返回了非法的 argv；拒绝启动服务器。');
+      }
+      return wrapped;
+    };
     if (policy?.mode === 'danger-full-access') return { mode: 'danger-full-access', policy, confine: null, env: null, writeMode };
-    if (typeof this.confine !== 'function' || !this.hasSandbox()) {
+    if (typeof this.sandboxConfine !== 'function' || !this.hasSandbox()) {
       const error = new Error(`LSP server execution requires an available sandbox backend for the ${policy?.mode ?? 'unknown'} policy, but no sandbox service is loaded. A human must choose danger-full-access, or the deployment must provide a usable sandbox runner. No process was started by this call.`);
+      error.code = 'SANDBOX_UNAVAILABLE';
       this.retireSession(session, error);
       throw error;
     }
-    return { mode: policy?.mode ?? 'unknown', policy, confine: this.confine, env: sandboxEnvironment(this.sandboxConfig), writeMode };
+    return { mode: policy?.mode ?? 'unknown', policy, confine: confineArgv, env: sandboxEnvironment(this.sandboxConfig), writeMode };
   }
 
   /** 兼容旧调用点：只做权限判定，不返回执行计划。 */
@@ -120,7 +132,14 @@ export class LspSessionPool {
     const now = Date.now();
     for (const entry of this.entries) {
       if (entry.retired) continue;
-      try { this.executionFor(entry.session); } catch { continue; }
+      let execution;
+      try { execution = this.executionFor(entry.session); } catch { continue; }
+      // 权限模式变化必须换掉实例：DFA 下启动的进程是无沙箱的，
+      // 会话收紧后不能继续沿用旧执行计划（这条路径覆盖没有 session/event 的轮询兜底）。
+      if (entry.mode !== execution.mode) {
+        this.retire(entry, new Error(`LSP session policy changed to ${execution.mode}`));
+        continue;
+      }
       if (entry.active === 0 && now - entry.lastUsed >= this.config.idleTimeoutMs) this.retire(entry);
     }
   }
@@ -131,6 +150,11 @@ export class LspSessionPool {
       signal?.throwIfAborted();
       this.sweep();
       let entry = [...this.entries].find(item => !item.retired && item.session === session && item.workspace === workspace);
+      if (entry && entry.mode !== execution.mode) {
+        // 权限在两次调用之间变了：退休旧实例，回到循环用新的执行计划重建。
+        await this.retire(entry, new Error(`LSP session policy changed to ${execution.mode}`));
+        entry = undefined;
+      }
       if (!entry && this.entries.size >= this.config.maxSessions) {
         const idle = [...this.entries].filter(item => !item.retired && item.active === 0).sort((a, b) => a.lastUsed - b.lastUsed)[0];
         if (idle) await this.retire(idle);

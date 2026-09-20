@@ -82,12 +82,20 @@ test('发现 API：GET/POST 注册、会话绑定、权限门控与请求体校�
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'session-1' }),
     }));
     assert.equal(scanned.status, 200);
-    // 验证会启动进程：受限会话且没有沙箱后端时必须拒绝，而不是无沙箱运行。
-    const denied = await restricted.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
+    const scannedBody = await body(scanned);
+    // 验证会启动进程：受限会话且没有沙箱后端时不启动任何服务器，但扫描状态仍然返回
+    // （诊断先入缓存，模型上下文不会因此退化成“未扫描到”）。
+    const refused = await restricted.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'session-1', verify: true }),
     }));
-    assert.equal(denied.status, 403);
-    assert.match((await body(denied)).error.code, /sandbox-unavailable/);
+    assert.equal(refused.status, 200);
+    const refusedBody = await body(refused);
+    assert.deepEqual(refusedBody.verification, []);
+    assert.equal(refusedBody.verificationRefused.code, 'sandbox-unavailable', '对外 code 必须稳定');
+    assert.match(refusedBody.verificationRefused.message, /沙箱|完全访问/);
+    // 拒绝验证不能把诊断结果一起丢掉：应与普通扫描结果完全一致且非空。
+    assert.ok(scannedBody.servers.length > 0, '前置条件：扫描应发现服务器');
+    assert.deepEqual(refusedBody.servers, scannedBody.servers);
     await Promise.all([...allowed.cleanups, ...restricted.cleanups].map(cleanup => cleanup()));
   } finally { await rm(workspace, { recursive: true, force: true }); }
 });

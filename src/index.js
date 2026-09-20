@@ -218,7 +218,7 @@ function setupTargets(diagnosis, server) {
 /**
  * 执行一次 lsp_setup 调用。installation 只有在 operation 为 install/auto 且 apply===true 时才会发生。
  */
-export async function runSetup({ operation, args, workspace, config, scope, cache, execution = null, signal, probe = probeLanguageServer, diagnose = diagnoseWorkspace, install = applyInstallPlan }) {
+export async function runSetup({ operation, args, workspace, config, scope, cache, execution = null, spawnRefused = null, signal, probe = probeLanguageServer, diagnose = diagnoseWorkspace, install = applyInstallPlan }) {
   const server = args.server;
   const languages = parseLanguages(args.languages);
   const diagnoseOnce = () => diagnose({ workspace, languages, install: config.install, configured: config.servers, signal });
@@ -268,10 +268,18 @@ export async function runSetup({ operation, args, workspace, config, scope, cach
   }
 
   if (operation === 'verify' || operation === 'auto') {
-    const scoped = server === undefined ? diagnosis : { ...diagnosis, servers: setupTargets(diagnosis, server) };
-    const verification = await verifyDiagnosis(scoped, { workspace, signal, probe, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution?.confine ?? null, env: execution?.env ?? null });
-    if (verification.length) result.verification.push(...verification);
-    else result.verification.push({ ok: false, reason: '没有可验证的服务器：需要已发现的程序且运行组件齐备。' });
+    // 双重保险：允许启动但拿不到沙箱包装（非完全访问）时同样不 probe。
+    if (!spawnRefused && execution && execution.mode !== 'danger-full-access' && typeof execution.confine !== 'function') {
+      result.verificationRefused = { code: 'sandbox-unavailable', message: '受限会话没有可用的沙箱包装，因此没有启动任何服务器进行验证。' };
+    } else if (spawnRefused) {
+      // 不允许启动进程时绝不 probe：受限会话没有沙箱后端就是这种情况。
+      result.verificationRefused = { code: 'sandbox-unavailable', message: spawnRefused };
+    } else {
+      const scoped = server === undefined ? diagnosis : { ...diagnosis, servers: setupTargets(diagnosis, server) };
+      const verification = await verifyDiagnosis(scoped, { workspace, signal, probe, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution?.confine ?? null, env: execution?.env ?? null });
+      if (verification.length) result.verification.push(...verification);
+      else result.verification.push({ ok: false, reason: '没有可验证的服务器：需要已发现的程序且运行组件齐备。' });
+    }
   }
 
   // 让模型的上下文与刚完成的操作保持一致，无需再手动 status 一次。
@@ -280,7 +288,9 @@ export async function runSetup({ operation, args, workspace, config, scope, cach
   return {
     ...result,
     status: statusView(diagnosis),
-    nextActions: diagnosis.nextActions,
+    nextActions: result.verificationRefused
+      ? [...diagnosis.nextActions, `验证未执行：${result.verificationRefused.message}`]
+      : diagnosis.nextActions,
   };
 }
 
@@ -364,15 +374,20 @@ export function apply(ctx, input = {}) {
   const environmentBase = structuredClone(baseConfig);
   // 受限会话下的进程约束来自 sandbox 服务；它可能尚未加载，因此按需读取而不是创建时快照。
   let sandboxService = null;
-  if (typeof ctx.inject === 'function') ctx.inject(['sandbox'], sandboxCtx => { sandboxService = sandboxCtx.sandbox; });
+  if (typeof ctx.inject === 'function') ctx.inject(['sandbox'], sandboxCtx => {
+    sandboxService = sandboxCtx.sandbox;
+    // 服务被卸载/替换时必须失效，否则 hasSandbox() 会把失效的服务当可用。
+    sandboxCtx.effect?.(() => () => { if (sandboxService === sandboxCtx.sandbox) sandboxService = null; }, 'dsh-lsp-bridge: sandbox availability');
+  });
   const makePool = value => new LspSessionPool(value, session => ctx.sandboxPolicy.resolve({ session }), {
-    confine: (argv, policy) => {
+    // 直接交给池调用；解包与校验在池层统一完成（单一契约）。
+    sandboxConfine: (argv, policy) => {
       if (sandboxService === null) {
         const error = new Error('no sandbox service is loaded');
         error.code = 'SANDBOX_UNAVAILABLE';
         throw error;
       }
-      return sandboxService.confine(argv, policy).argv;
+      return sandboxService.confine(argv, policy);
     },
     sandbox: value.sandbox,
     hasSandbox: () => sandboxService !== null,
@@ -451,15 +466,26 @@ export function apply(ctx, input = {}) {
         try {
           // 只读诊断在任何权限下都可以做；验证会启动进程，因此受限会话必须经由会话沙箱约束。
           const diagnosis = await diagnoseWorkspace({ workspace: session.header.cwd, languages: parsed.body.languages, install: config.install, configured: config.servers, signal: request.signal });
+          // 诊断先入缓存：即使验证被拒，界面与模型上下文也能拿到真实状态，而不是“未扫描到”。
+          diagnosisCache.set(session.header.cwd, diagnosis);
+          if (parsed.body.verify !== true) return jsonResponse(diagnosis);
           let execution = null;
-          if (parsed.body.verify === true) {
-            try { execution = pool.executionFor(session); }
-            catch (error) { return errorResponse(403, 'sandbox-unavailable', `当前会话（${error.message.includes('danger-full-access') ? '受限权限且没有可用沙箱后端' : '未知权限'}）无法安全地启动语言服务器进行验证。`); }
+          try {
+            execution = pool.executionFor(session);
+          } catch (error) {
+            // 验证拿不到执行计划（受限权限且没有可用沙箱后端）时，如实返回原因而不是丢掉整次扫描。
+            return jsonResponse({
+              ...diagnosis,
+              verification: [],
+              verificationRefused: {
+                code: 'sandbox-unavailable',
+                detail: error.code ?? null,
+                message: '验证需要在受限会话中可用的沙箱后端；当前会话没有可用的沙箱运行器，因此没有启动任何服务器。改用 danger-full-access 会话，或让部署提供可用的沙箱运行器后可重试。',
+              },
+            });
           }
-          const verification = parsed.body.verify === true
-            ? await verifyDiagnosis(diagnosis, { workspace: session.header.cwd, signal: request.signal, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution.confine, env: execution.env })
-            : null;
-          const result = verification === null ? diagnosis : { ...diagnosis, verification };
+          const verification = await verifyDiagnosis(diagnosis, { workspace: session.header.cwd, signal: request.signal, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution.confine, env: execution.env });
+          const result = { ...diagnosis, verification };
           diagnosisCache.set(session.header.cwd, result);
           return jsonResponse(result);
         } catch (error) {
@@ -528,13 +554,15 @@ export function apply(ctx, input = {}) {
         throw new Error(`lsp_setup 的安装步骤需要 danger-full-access 会话（当前 ${policy?.mode ?? 'unknown'}）：安装器在插件内直接执行，不经过会话沙箱，也不会自动提权。可以先在受限会话中完成 status/verify。`);
       }
       let execution = null;
+      let spawnRefused = null;
       try { execution = pool.executionFor(session); }
       catch (error) {
         if (installs) throw error;
-        // 受限会话且没有沙箱后端：诊断仍然可用，只是不能启动服务器。
-        execution = { confine: null, env: null };
+        // 受限会话且没有沙箱后端：诊断与配置仍然可用，但绝不能启动服务器，
+        // 因此把原因带进 runSetup，而不是给它一个空的 confine。
+        spawnRefused = error.message;
       }
-      const result = await runSetup({ operation: args.operation, args, workspace: session.header.cwd, config, scope: settingsScope, cache: diagnosisCache, execution, signal: exec.signal });
+      const result = await runSetup({ operation: args.operation, args, workspace: session.header.cwd, config, scope: settingsScope, cache: diagnosisCache, execution, spawnRefused, signal: exec.signal });
       return boundedResult(result, config.maxOutputChars);
     },
     presentCall: args => ({

@@ -66,9 +66,11 @@ test('写入操作：dry-run 不改盘，apply 真正落盘，只读与工作区
   const workspace = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-write-')));
   await writeFile(join(workspace, 'main.mock'), 'original name\n');
   await writeFile(join(workspace, 'other.mock'), 'other file\n');
+  const records = join(workspace, 'opens.txt');
+  await writeFile(records, '');
   const outside = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-outside-')));
   await writeFile(join(outside, 'other.mock'), 'outside name\n');
-  const server = { id: 'mock', command: process.execPath, args: [mock], languages: { mock: ['.mock'] }, rootMarkers: [] };
+  const server = { id: 'mock', command: process.execPath, args: [mock, `--record-opens=${records}`], languages: { mock: ['.mock'] }, rootMarkers: [] };
   const deny = new LspManager({ timeoutMs: 1000, servers: [server], writeMode: 'deny' });
   const scoped = new LspManager({ timeoutMs: 1000, servers: [server], writeMode: 'workspace' });
   const full = new LspManager({ timeoutMs: 1000, servers: [server], writeMode: 'full' });
@@ -89,21 +91,66 @@ test('写入操作：dry-run 不改盘，apply 真正落盘，只读与工作区
   assert.equal(applied.applied, true);
   assert.equal(await readFile(join(workspace, 'main.mock'), 'utf8'), 'renamed name\n');
   // rename 前必须预热项目，否则服务器看不到引用目标符号的其它文件，跨文件改名会改坏代码。
-  const afterRename = await scoped.execute({ operation: 'status' }, { workspace });
-  assert.ok(afterRename.instances[0].documents >= 2, 'rename 会预热项目内的其它文件');
+  // 这里直接断言 mock 记录到的 didOpen：必须包含目标文件之外的其它文件。
+  const opened = await readFile(records, 'utf8');
+  assert.match(opened, /main\.mock/, '预热与请求会打开目标文件');
+  assert.match(opened, /other\.mock/, 'rename 会预热项目内的其它文件');
 
   // 工作区外的目标：无论权限如何都不越界，并说明工作区边界。
   await assert.rejects(full.applyEdit({
     workspace,
     dryRun: false,
     edit: { changes: { [pathToFileURL(join(outside, 'other.mock')).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } }, newText: 'changed' }] } },
-  }), /不在会话工作区内/);
+  }), /工作区之外|不在会话工作区内/);
   assert.equal(await readFile(join(outside, 'other.mock'), 'utf8'), 'outside name\n');
+
+  // 多文件批次是“全或无”：第二个目标越界时，第一个文件也不能被写入。
+  const beforeBatch = await readFile(join(workspace, 'main.mock'), 'utf8');
+  await assert.rejects(full.applyEdit({
+    workspace,
+    dryRun: false,
+    edit: { documentChanges: [
+      { textDocument: { uri: pathToFileURL(join(workspace, 'main.mock')).href }, edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'Z' }] },
+      { textDocument: { uri: pathToFileURL(join(outside, 'other.mock')).href }, edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'Z' }] },
+    ] },
+  }), /工作区之外|不在会话工作区/);
+  assert.equal(await readFile(join(workspace, 'main.mock'), 'utf8'), beforeBatch, '规划阶段发现越界时不得写入任何文件');
 
   // 服务器主动请求应用编辑：只读会话回传原因而不是静默失败。
   const refused = await deny.applyServerEdit({ changes: { [pathToFileURL(join(workspace, 'main.mock')).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'X' }] } }, workspace);
   assert.equal(refused.applied, false);
   assert.match(refused.failureReason, /完全访问权限/);
+});
+
+test('服务器发起的 applyEdit：可写会话真正落盘，探针与只读会话一律不写入', async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-apply-')));
+  const target = join(workspace, 'target.mock');
+  const original = 'BEFORE text\n';
+  await writeFile(target, original);
+  // mock 在 initialize 阶段请求 applyEdit，并等它的响应到达后才回复 initialize，
+  // 因此 initialize 返回即代表写入路径已经走完，无需 sleep 等待。
+  const server = { id: 'mock', command: process.execPath, args: [mock, `--edit-target=${target}`], languages: { mock: ['.mock'] }, rootMarkers: [] };
+  t.after(async () => { await rm(workspace, { recursive: true, force: true }); });
+
+  // 可写会话：服务器请求的编辑被应用。
+  const writable = new LspManager({ timeoutMs: 5000, servers: [server], writeMode: 'workspace' });
+  try {
+    await writable.execute({ operation: 'documentSymbols', file: 'target.mock' }, { workspace });
+    assert.equal(await readFile(target, 'utf8'), 'SERVER EDIT text\n', '服务器发起的编辑应落盘');
+  } finally { await writable.dispose(); }
+
+  // 只读会话：同一请求被拒绝，文件保持原样。
+  await writeFile(target, original);
+  const readOnly = new LspManager({ timeoutMs: 5000, servers: [server], writeMode: 'deny' });
+  try {
+    await readOnly.execute({ operation: 'documentSymbols', file: 'target.mock' }, { workspace });
+    assert.equal(await readFile(target, 'utf8'), original, '只读会话不得写入');
+  } finally { await readOnly.dispose(); }
+
+  // 验证探针永远只读：即使服务器在 initialize 阶段请求写入也不改文件。
+  const { probeLanguageServer } = await import('../src/engine.js');
+  await probeLanguageServer({ server, workspace, timeoutMs: 5000 });
+  assert.equal(await readFile(target, 'utf8'), original, '探针不得写入');
 });
 
 test('受限会话下 confine 包装真实 argv，并向服务器注入缓存环境', async t => {

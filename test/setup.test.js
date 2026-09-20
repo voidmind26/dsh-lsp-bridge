@@ -249,6 +249,29 @@ test('验证：只针对齐备服务器、逐个报告成败、可被打断、�
   assert.equal(projectResults[0].root, projectRoot);
 });
 
+test('不允许启动进程时，runSetup 不 probe 而是给出结构化原因', async () => {
+  const harness = setupHarness({ servers: installed => [tsEntry(installed)] });
+  let probes = 0;
+  const result = await runSetup({
+    operation: 'verify',
+    args: { operation: 'verify' },
+    workspace: '/ws',
+    config: { install: { enabled: true } },
+    scope: harness.scope,
+    // 受限会话没有沙箱后端：execution 为空且带 spinRefused。
+    execution: null,
+    spawnRefused: 'workspace-write 会话没有可用沙箱后端',
+    diagnose: harness.diagnose,
+    install: harness.install,
+    probe: async () => { probes++; return { root: '/ws', capabilities: [] }; },
+  });
+  assert.equal(probes, 0, '被拒绝时绝不启动任何服务器');
+  assert.deepEqual(result.verification, []);
+  assert.equal(result.verificationRefused.code, 'sandbox-unavailable');
+  assert.match(result.verificationRefused.message, /沙箱/);
+  assert.match(result.nextActions.join('\n'), /验证未执行/);
+});
+
 test('诊断按服务器自己的项目目录进行，不绑定会话工作区', async () => {
   const workspace = await workspaceWith(['src/keep.txt']);
   const outside = await workspaceWith(['other/keep.txt']);

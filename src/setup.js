@@ -445,7 +445,7 @@ export function configServersFromDiagnosis(diagnosis, { servers, choices = {} } 
  * 验证是唯一能区分“文件存在”和“真的能用”的手段，因此结果单独返回，不与诊断状态混用。
  * 只验证前 limit 个，避免一次拉起过多进程；请求取消时停止后续验证。
  */
-export async function verifyDiagnosis(diagnosis, { workspace, signal, probe = probeLanguageServer, timeoutMs = VERIFY_TIMEOUT_MS, limit = MAX_VERIFY_SERVERS } = {}) {
+export async function verifyDiagnosis(diagnosis, { workspace, signal, probe = probeLanguageServer, timeoutMs = VERIFY_TIMEOUT_MS, limit = MAX_VERIFY_SERVERS, confine = null, env = null } = {}) {
   const targets = diagnosis.servers
     .filter(entry => entry.command && !entry.dependencies.some(dependency => !dependency.satisfied))
     .slice(0, limit);
@@ -459,7 +459,8 @@ export async function verifyDiagnosis(diagnosis, { workspace, signal, probe = pr
     }
     try {
       // 用条目自己的目标目录验证：LSP 属于项目，不属于会话。
-      const probed = await probe({ server: definition, workspace: entry.target ?? workspace, signal, timeoutMs });
+      // 探针必须带上调用方的沙箱包装与缓存环境：受限会话下不允许无沙箱启动服务器。
+      const probed = await probe({ server: definition, workspace: entry.target ?? workspace, signal, timeoutMs, confine, env });
       results.push({ serverId: entry.serverId, ok: true, root: probed.root, serverInfo: probed.serverInfo, capabilities: probed.capabilities, positionEncoding: probed.positionEncoding });
     } catch (error) {
       if (signal?.aborted) break;
