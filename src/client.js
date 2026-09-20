@@ -117,16 +117,41 @@ window.__ModuleLoader__.load({
       : badge('未验证', '');
 
     /** 验证结果详情，放进展开正文。 */
+    /** 验证结果只报“能不能用 + 支持哪些常用能力”，协议里的完整能力清单收进折叠区。 */
+    const CAPABILITY_TEXT = [
+      ['hoverProvider', '悬停'], ['definitionProvider', '定义'], ['referencesProvider', '引用'],
+      ['implementationProvider', '实现'], ['typeDefinitionProvider', '类型定义'],
+      ['documentSymbolProvider', '文档符号'], ['workspaceSymbolProvider', '工作区符号'],
+      ['renameProvider', '重命名'], ['documentFormattingProvider', '格式化'], ['diagnosticProvider', '诊断'],
+    ];
+    /** 能力清单里真正会被用到的那些翻译成人话，其余只报数量。 */
+    function capabilitySummary(capabilities = []) {
+      const known = CAPABILITY_TEXT.filter(([key]) => capabilities.includes(key)).map(([, label]) => label);
+      if (!capabilities.length) return '未报告能力';
+      if (!known.length) return `共 ${capabilities.length} 项能力`;
+      return `支持 ${known.join('、')}${capabilities.length > known.length ? ` 等 ${capabilities.length} 项能力` : ''}`;
+    }
+    /** 服务器自报信息：只显示短名字/短版本，gopls 那种塞在 version 里的长 JSON 不往界面上倒。 */
+    function serverLabel(info) {
+      if (!info || typeof info !== 'object') return null;
+      const name = typeof info.name === 'string' && info.name ? info.name : null;
+      const version = typeof info.version === 'string' && info.version.length <= 40 && !info.version.startsWith('{') ? info.version : null;
+      return name || version ? [name, version].filter(Boolean).join(' ') : null;
+    }
     function VerificationDetail({ item }) {
       if (!item) return h('p', { className: 'lsp-muted' }, '尚未验证：本次未启动该服务器（缺少程序或运行组件时不会验证）。');
       if (!item.ok) return h('div', { className: 'lsp-inset' },
         h('p', { className: 'lsp-muted' }, '验证失败（服务器启动或 initialize 未通过）'),
         h('code', { className: 'lsp-code' }, item.error || '未知错误'));
+      const label = serverLabel(item.serverInfo);
+      const capabilities = item.capabilities || [];
       return h('div', { className: 'lsp-inset' },
-        h('p', { className: 'lsp-muted' }, `验证通过 · ${(item.capabilities || []).length} 项能力${item.positionEncoding ? ` · ${item.positionEncoding}` : ''}`),
-        item.serverInfo ? h('p', { className: 'lsp-muted' }, `服务器信息：${JSON.stringify(item.serverInfo)}`) : null,
+        h('p', { className: 'lsp-muted' }, `验证通过 · ${capabilitySummary(capabilities)}${item.positionEncoding ? ` · ${item.positionEncoding}` : ''}`),
+        label ? h('p', { className: 'lsp-muted' }, `服务器：${label}`) : null,
         item.root ? h('code', { className: 'lsp-code lsp-ellipsis', title: item.root }, `项目根目录：${item.root}`) : null,
-        (item.capabilities || []).length ? h('p', { className: 'lsp-muted' }, `能力：${item.capabilities.join('、')}`) : null);
+        capabilities.length ? h('details', null,
+          h('summary', { className: 'lsp-muted' }, `全部能力（${capabilities.length}）`),
+          h('p', { className: 'lsp-muted' }, capabilities.join('、'))) : null);
     }
 
     /** 安装计划摘要：让用户看到将要执行的确切命令，而不是一句“自动安装”。 */
@@ -143,14 +168,13 @@ window.__ModuleLoader__.load({
           h('code', { className: 'lsp-code' }, `${step.file} ${step.args.join(' ')}`)))));
     }
 
-    /** 每张候选卡片给出“能不能用、缺什么、下一步做什么”；细节由展开控制。 */
+    /** 每张卡片回答“这台语言服务器能不能用、缺什么、下一步做什么”；项目范围是它的属性，不是主角。 */
     function ServerCard({ entry, choices, onChoose, open, onToggle, verification }) {
       const missing = unsatisfied(entry);
       const tone = entry.status === 'ready' ? 'lsp-success' : 'lsp-warning';
       const summary = [
-        entry.language,
-        (entry.roots || []).length ? `${entry.roots.length} 个项目根目录` : '项目根随工作区自动判定',
-        entry.status === 'ready' ? (COMMAND_SOURCE_TEXT[entry.commandSource] || '') : '',
+        `语言 ${entry.language}`,
+        entry.status === 'needs-choice' ? '需要选择程序' : entry.status === 'ready' ? (COMMAND_SOURCE_TEXT[entry.commandSource] || '程序已就绪') : '',
       ].filter(Boolean).join(' · ');
       return h(DisclosureCard, {
         id: `lsp-server-${entry.serverId}`, title: entry.serverId,
@@ -172,7 +196,10 @@ window.__ModuleLoader__.load({
             : h('p', { className: 'lsp-muted' }, dependency.reason || '缺少该组件')))) : null,
       entry.status === 'missing-command' || missing ? h(InstallPlan, { entry }) : null,
       entry.status === 'ready' || entry.status === 'needs-choice' ? null : h('p', { className: 'lsp-muted' }, '可让智能体直接执行自动安装：调用 lsp_setup（operation="auto", apply=true）。'),
-      (entry.roots || []).length ? h('p', { className: 'lsp-muted lsp-ellipsis', title: (entry.roots || []).join('\n') }, `项目根目录：${(entry.roots || []).join('、')}`) : null);
+      // 项目范围放在最后：它决定这台服务器评估哪里，但不是“选哪台服务器”的依据。
+      h('p', { className: 'lsp-muted lsp-ellipsis', title: (entry.roots || []).join('\n') },
+        (entry.roots || []).length ? `项目范围：${(entry.roots || []).join('、')}` : '项目范围：随会话工作区与项目标记自动判定'),
+      entry.targetSource === 'config' ? h('p', { className: 'lsp-muted' }, '评估目录来自配置的项目根（可在 JSON 里改 roots；改成 [] 即回到自动判定）') : null);
     }
 
     function DiscoveryReport({ report, choices, onChoose, verification = {} }) {
@@ -183,19 +210,19 @@ window.__ModuleLoader__.load({
       const setAll = value => setExpanded(Object.fromEntries(servers.map(entry => [planKey(entry), value])));
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
         h('div', { className: 'lsp-row' },
-          h('p', { className: 'lsp-muted' }, `发现 ${(report.projects || []).length} 个项目，${servers.length} 个语言服务器，其中 ${usable} 个可直接使用`),
+          h('p', { className: 'lsp-muted' }, `${servers.length} 台语言服务器，${usable} 台可直接使用${(report.projects || []).length ? ` · 扫描到 ${(report.projects || []).length} 个项目` : ''}`),
           h('div', { className: 'lsp-actions' },
             h('button', { type: 'button', disabled: allOpen || !servers.length, onClick: () => setAll(true) }, '展开全部'),
             h('button', { type: 'button', disabled: !servers.some(entry => expanded[planKey(entry)]), onClick: () => setAll(false) }, '收起全部'),
             badge(report.complete ? '扫描完成' : '扫描已截断', report.complete ? 'lsp-success' : 'lsp-warning'))),
-        !report.complete ? h('p', { className: 'lsp-muted' }, '扫描达到限制，以下不是完整结果。可选择范围更小的工作区重新扫描，或在高级 JSON 中补充配置。') : null,
+        !report.complete ? h('p', { className: 'lsp-muted' }, '扫描达到限制，以下不是完整结果。可选择范围更小的工作区重新扫描，或在配置 JSON 中补充。') : null,
         h('div', { className: 'lsp-grid' }, servers.map(entry => h(ServerCard, {
           key: planKey(entry), entry, choices, onChoose, verification: verification[entry.serverId],
           open: Boolean(expanded[planKey(entry)]),
           onToggle: () => setExpanded(previous => ({ ...previous, [planKey(entry)]: !previous[planKey(entry)] })),
         }))),
-        !servers.length ? h('p', { className: 'lsp-empty lsp-muted' }, '未发现支持的项目类型。你仍可在高级 JSON 中手工配置其他语言服务器。') : null,
-        h('details', null, h('summary', null, `查看项目路径（${(report.projects || []).length}）`),
+        !servers.length ? h('p', { className: 'lsp-empty lsp-muted' }, '这次扫描没有发现可添加的语言服务器。可以换一个含目标项目的会话，或直接在配置 JSON 中手工添加。') : null,
+        h('details', null, h('summary', { className: 'lsp-muted' }, `查看扫描到的项目（${(report.projects || []).length}）`),
           h('ul', { className: 'lsp-projects' }, (report.projects || []).map(project => h('li', { key: `${project.language}:${project.root}` },
             h('code', { className: 'lsp-code' }, project.root), h('p', { className: 'lsp-muted' }, `${project.language} · ${project.markers.join(', ')}`))))));
     }
@@ -308,19 +335,20 @@ window.__ModuleLoader__.load({
           open: Boolean(openServers[index]),
           onToggle: () => setOpenServers(previous => ({ ...previous, [index]: !previous[index] })),
         },
-        h('p', { className: 'lsp-muted lsp-ellipsis', title: target || '' }, `评估目录：${target || '未确定'}${entry?.targetSource === 'config' ? '（来自配置的项目根目录）' : '（随工作区与项目标记自动判定）'}`),
         VerificationDetail({ item }),
         !entry ? h('p', { className: 'lsp-muted' }, '本次扫描没有评估它：可能是没有显式根目录，且当前工作区里也没有对应项目。为它配置 roots 或 workspaceFolders 后即可扫描与验证。') : null,
         h('p', { className: 'lsp-muted' }, '程序路径'),
         h('code', { className: 'lsp-code' }, typeof server?.command === 'string' ? server.command : '尚未设置程序路径'),
         h('p', { className: 'lsp-muted' }, `启动参数：${JSON.stringify(server?.args ?? [])}`),
         h('p', { className: 'lsp-muted' }, `语言：${serverLanguages(server).join('、') || '未配置'}`),
+        // 项目范围是这台服务器的属性：程序与语言之后才是它，避免卡片一展开就像在配目录。
+        h('p', { className: 'lsp-muted lsp-ellipsis', title: target || '' }, `评估目录：${target || '未确定'}${entry?.targetSource === 'config' ? '（来自配置的项目根目录）' : '（随工作区与项目标记自动判定）'}`),
         (server?.roots || []).length ? h('p', { className: 'lsp-muted lsp-ellipsis', title: server.roots.join('\n') }, `项目根目录（固定评估）：${server.roots.join('、')}`) : h('p', { className: 'lsp-muted' }, '项目根目录：未固定，随当前会话工作区与最近的项目标记自动判定'),
         (server?.workspaceFolders || []).length ? h('p', { className: 'lsp-muted lsp-ellipsis', title: server.workspaceFolders.join('\n') }, `声明给服务器的工作区目录（多仓）：${server.workspaceFolders.join('、')}`) : null,
         server?.initializationOptions ? h('p', { className: 'lsp-muted' }, `初始化选项：${JSON.stringify(server.initializationOptions)}`) : null,
         entry?.dependencies?.length ? h('p', { className: 'lsp-muted' }, `运行组件：${entry.dependencies.map(dependency => `${dependency.satisfied ? '✓' : '✗'} ${dependency.description || dependency.id}`).join('；')}`) : null,
         h('details', null, h('summary', null, '查看完整配置'), h('code', { className: 'lsp-code' }, JSON.stringify(server, null, 2))),
-        h('div', { className: 'lsp-actions' }, h('button', { type: 'button', disabled: busy, onClick: () => setView('add') }, '编辑配置 JSON')));
+        h('div', { className: 'lsp-actions' }, h('button', { type: 'button', disabled: busy, onClick: () => setView('json') }, '编辑配置 JSON')));
       }
 
       /** 列表视图：进入设置先只看到所有已配置的服务器。 */
@@ -332,53 +360,63 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', disabled: busy || !sessionId, onClick: () => { void discover(); } }, '重新扫描并验证')),
         !parsed.error && servers.length
           ? h('div', { className: 'lsp-grid' }, servers.map(serverCard))
-          : !parsed.error ? h('p', { className: 'lsp-empty lsp-muted' }, '尚未配置语言服务器。点击右上角「＋ 新增配置」扫描工作区，或直接写入 JSON。') : null,
+          : !parsed.error ? h('p', { className: 'lsp-empty lsp-muted' }, '尚未配置语言服务器。点击右上角「＋ 新增语言服务器」扫描并加入，或用「编辑配置 JSON」手工添加。') : null,
         report?.verificationRefused ? h('p', { className: 'lsp-alert lsp-warning', role: 'status' }, `验证未执行：${report.verificationRefused.message}`) : null,
         report?.sandboxWarning ? h('p', { className: 'lsp-alert lsp-warning', role: 'status' }, `沙箱缓存提示：${report.sandboxWarning}`) : null,
         servers.length ? h('p', { className: 'lsp-muted' }, '项目根有三种来源：配置的 roots（固定评估某个工程）、配置的 workspaceFolders（多仓一起声明）、都不填时随会话工作区与最近的项目标记自动判定。因此验证不依赖某个会话，扫描一次即可覆盖不同项目的服务器。') : null);
 
-      /** 新增/编辑视图：扫描、候选审阅与完整 JSON。 */
+      /** 新增语言服务器视图：先选服务器、再看缺什么、最后加入配置；项目范围只是服务器的一个属性。 */
       const addSections = [
         h('section', { className: 'lsp-section', key: 'scan' },
-          step('1', '工作区扫描', '选择活动会话，查找项目、语言服务器及其运行组件。扫描只读：不启动程序，也不安装软件。'),
+          step('1', '选择语言服务器', '挑要接入的语言服务器，并查看它在这台机器与当前工作区里的状态。扫描只读：不启动程序，也不安装软件。'),
           h('div', { className: 'lsp-controls' },
-            h('label', { className: 'lsp-field' }, '工作区会话',
-              h('select', { 'aria-label': '工作区会话', value: sessionId, disabled: busy, onChange: event => { const next = event.target.value; switchSession(next); void discover(next, { verify: true }); } },
+            h('label', { className: 'lsp-field' }, '扫描范围（会话）',
+              h('select', { 'aria-label': '扫描范围会话', value: sessionId, disabled: busy, onChange: event => { const next = event.target.value; switchSession(next); void discover(next, { verify: true }); } },
                 sessions.length ? sessions.map(session => h('option', { key: session.id, value: session.id, title: `${session.cwd}\n${session.id}` }, sessionLabel(session))) : h('option', { value: '' }, '没有活动会话'))),
             h('button', { type: 'button', disabled: busy, onClick: () => { void refreshSessions(); } }, '刷新会话'),
-            h('button', { type: 'button', className: 'lsp-primary', disabled: busy || !sessionId, onClick: () => { void discover(); } }, '扫描当前工作区')),
-          h('p', { className: 'lsp-muted' }, sessions.length ? '扫描只读，任何权限的会话都可以；验证会启动服务器，受限会话中服务器进程由会话沙箱约束（只能写工作区与临时目录），拿不到沙箱后端则失败关闭。不会自动提权。' : '先打开一个工程会话，再刷新列表。也可以直接在下方高级配置 JSON 中手工添加。'),
-          activeCwd ? h('p', { className: 'lsp-muted lsp-ellipsis', title: `${activeCwd}\n${sessionId}` }, `当前会话目录：${activeCwd}`) : null),
+            h('button', { type: 'button', className: 'lsp-primary', disabled: busy || !sessionId, onClick: () => { void discover(); } }, '重新扫描')),
+          h('p', { className: 'lsp-muted' }, sessions.length ? '会话只决定“扫哪些项目”和“用哪种授权启动服务器”：扫描只读，任何权限都可以；验证会启动服务器，受限会话中进程由会话沙箱约束（只能写工作区与临时目录），拿不到沙箱后端则失败关闭，不会自动提权。' : '先打开一个工程会话，再刷新列表；也可以在「编辑配置 JSON」里手工添加。'),
+          activeCwd ? h('p', { className: 'lsp-muted lsp-ellipsis', title: `${activeCwd}\n${sessionId}` }, `扫描目录：${activeCwd}`) : null),
         h('section', { className: 'lsp-section', key: 'candidates' },
-          step('2', '候选审阅', '检查程序路径、运行组件与项目范围。缺组件的服务器可以让智能体自动安装并写回配置。'),
-          report ? h('fieldset', { disabled: busy, style: { border: 0, padding: 0, margin: 0, minWidth: 0 } }, h('legend', { className: 'lsp-muted', style: { marginBottom: 12 } }, '语言服务器候选'), h(DiscoveryReport, { report, choices, verification, onChoose: (key, value) => { setChoices(previous => ({ ...previous, [key]: value })); } })) : h('p', { className: 'lsp-empty lsp-muted' }, '尚未扫描。扫描完成后，可用服务器与待选择的程序会显示在这里。'),
+          step('2', '加入配置', '展开一台服务器看程序路径、运行组件与项目范围；缺组件的可以让智能体自动安装。'),
+          report ? h('fieldset', { disabled: busy, style: { border: 0, padding: 0, margin: 0, minWidth: 0 } }, h('legend', { className: 'lsp-muted', style: { marginBottom: 12 } }, '可添加的语言服务器'), h(DiscoveryReport, { report, choices, verification, onChoose: (key, value) => { setChoices(previous => ({ ...previous, [key]: value })); } })) : h('p', { className: 'lsp-empty lsp-muted' }, '尚未扫描。扫描完成后，语言服务器与其状态会显示在这里。'),
           report?.verificationRefused ? h('p', { className: 'lsp-alert lsp-warning', role: 'status' }, `验证未执行：${report.verificationRefused.message}`) : null,
           report?.sandboxWarning ? h('p', { className: 'lsp-alert lsp-warning', role: 'status' }, `沙箱缓存提示：${report.sandboxWarning}`) : null,
           report ? h('div', { className: 'lsp-inset' },
             h('p', { className: 'lsp-muted' }, '按服务器 id 合并：保留其他服务器；同 id 的命令、参数、语言与运行组件会被建议覆盖，其余字段保留。项目根不写进配置——不填 roots 时随会话工作区与项目标记自动判定；要多仓一起评估请用 workspaceFolders；只有需要固定评估某个工程时才填 roots。也可在会话中让智能体调用 lsp_setup 自动完成安装、配置与验证。'),
             h('div', { className: 'lsp-row' }, h('p', { className: 'lsp-muted' }, `${selectedCount} 项建议可加入 · 加入后仍需保存`),
-              h('button', { type: 'button', disabled: busy || Boolean(parsed.error) || !selectedCount, onClick: () => { try { edit(suggestedConfig(report, draft, choices)); setError(''); } catch (err) { setError(err.message); } } }, '合并可用建议到草稿')),
-            parsed.error ? h('p', { className: 'lsp-muted' }, '草稿 JSON 无效，修正后才能合并建议。') : null) : null),
-        h('section', { className: 'lsp-section', key: 'json' },
-          step('3', '高级配置 JSON', '在此新增或调整服务器。请勿填写凭据；env 仅支持部署配置。服务器配置最终由 Host 校验。'),
-          h('textarea', { 'aria-label': '完整配置 JSON', value: draft, disabled: busy, onChange: event => edit(event.target.value), spellCheck: false, rows: 16 }),
-          h('p', { className: 'lsp-muted' }, '与「＋ 新增配置」等价的手工方式：直接加入 servers 条目即可。保存后返回列表可查看每个服务器的设置。')),
+              h('button', { type: 'button', className: 'lsp-primary', disabled: busy || Boolean(parsed.error) || !selectedCount, onClick: () => { try { edit(suggestedConfig(report, draft, choices)); setError(''); } catch (err) { setError(err.message); } } }, '加入配置')),
+            parsed.error ? h('p', { className: 'lsp-muted' }, '草稿 JSON 无效，修正后才能加入。') : null) : null,
+          servers.length ? h('p', { className: 'lsp-muted' }, `草稿里的服务器：${servers.map(server => server?.id || '未命名').join('、')}（保存后生效；要手工改字段请到「编辑配置 JSON」）`) : null),
       ];
 
+      /** 配置 JSON 视图：只做手工编辑，不掺扫描与候选。 */
+      const jsonSections = [
+        h('section', { className: 'lsp-section', key: 'json' },
+          step('1', '配置 JSON', '手工新增或调整服务器条目。请勿填写凭据；env 仅支持部署配置。服务器配置最终由 Host 校验。'),
+          h('textarea', { 'aria-label': '完整配置 JSON', value: draft, disabled: busy, onChange: event => edit(event.target.value), spellCheck: false, rows: 18 }),
+          h('p', { className: 'lsp-muted' }, '常见字段：command/args（可信程序）、languages（languageId → 扩展名）、rootMarkers（就近找项目标记）、roots（固定评估某个工程，可跨工作区）、workspaceFolders（多仓一起声明）、initializationOptions/settings。保存或放弃在页面底部。')),
+      ];
+
+      const VIEW_TEXT = {
+        list: ['LSP 语言服务', `为智能体连接代码语义能力 · 已配置 ${servers.length} 个语言服务器 · 点击卡片查看设置`],
+        add: ['新增语言服务器', '选要接入的语言服务器并加入配置；保存或放弃在页面底部。要手工改字段请用「编辑配置 JSON」。'],
+        json: ['编辑配置 JSON', '直接编辑完整配置；保存或放弃在页面底部。'],
+      };
+      const [viewTitle, viewSubtitle] = VIEW_TEXT[view] ?? VIEW_TEXT.list;
       return h('div', { className: 'lsp-settings', 'aria-busy': busy },
         h('style', null, css),
         h('header', { className: 'lsp-header' },
-          h('div', null,
-            h('h2', null, view === 'add' ? '新增 LSP 配置' : 'LSP 语言服务'),
-            h('p', { className: 'lsp-muted' }, view === 'add'
-              ? '扫描工作区、审阅候选并编辑配置 JSON；保存或放弃在页面底部。'
-              : `为智能体连接代码语义能力 · 已配置 ${servers.length} 个语言服务器 · 点击卡片查看设置`)),
+          h('div', null, h('h2', null, viewTitle), h('p', { className: 'lsp-muted' }, viewSubtitle)),
           h('div', { className: 'lsp-actions' },
-            view === 'add'
-              ? h('button', { type: 'button', disabled: busy, onClick: () => setView('list') }, '← 返回服务器列表')
-              : h('button', { type: 'button', className: 'lsp-primary', disabled: busy, onClick: () => setView('add') }, '＋ 新增配置'),
+            view === 'list'
+              ? h('button', { type: 'button', className: 'lsp-primary', disabled: busy, onClick: () => setView('add') }, '＋ 新增语言服务器')
+              : h('button', { type: 'button', disabled: busy, onClick: () => setView('list') }, '← 返回服务器列表'),
+            view === 'list'
+              ? h('button', { type: 'button', disabled: busy, onClick: () => setView('json') }, '编辑配置 JSON')
+              : null,
             badge(dirty ? '有未保存的修改' : snapshot.status === 'ready' ? '配置已同步' : '等待设置就绪', dirty ? 'lsp-warning' : ''))),
-        view === 'add' ? addSections : listSection,
+        view === 'add' ? addSections : view === 'json' ? jsonSections : listSection,
         parsed.error ? h('p', { className: 'lsp-alert lsp-error', role: 'alert' }, `JSON 无效：${parsed.error}`) : null,
         h('p', { className: 'lsp-muted' }, '保存后，语言工具调用会执行所配置的程序。语言服务器是未经 OS 沙箱隔离的本地程序，请只配置可信路径与参数。'),
         error ? h('p', { className: 'lsp-alert lsp-error', role: 'alert' }, error) : null,

@@ -186,14 +186,15 @@ test('折叠卡片与长路径省略：默认折叠、展开才显示细节', as
   assert.ok(!pathCollapsed.text.includes('/repo'), '折叠摘要不出现根目录路径');
   const pathExpanded = render(pathPlugin.testHelpers.ServerCard({ entry: pathEntry, choices: {}, onChoose() {}, open: true, onToggle() {} }), { visibleOnly: true });
   assert.ok(pathExpanded.text.includes('未找到 typescript'));
-  assert.ok(pathExpanded.text.includes('项目根目录：/repo'));
+  assert.ok(pathExpanded.text.includes('项目范围：/repo'), '项目范围是服务器的属性，放在卡片细节里');
 });
 
-test('双视图：默认只显示服务器列表，新增配置视图承载扫描与 JSON 编辑', async () => {
+test('三视图：默认只显示服务器列表，新增语言服务器与编辑配置 JSON 各自独立', async () => {
   const tree = await renderSettings();
   const labels = tree.elements.filter(node => node.type === 'button').map(buttonLabel);
-  assert.ok(labels.includes('＋ 新增配置'), '提供独立的新增配置入口');
-  assert.ok(!labels.includes('扫描当前工作区'), '列表视图不显示扫描控件');
+  assert.ok(labels.includes('＋ 新增语言服务器'), '提供独立的新增入口');
+  assert.ok(labels.includes('编辑配置 JSON'), 'JSON 编辑有独立入口，不在新增页面里');
+  assert.ok(!labels.includes('重新扫描'), '列表视图不显示扫描控件');
   assert.ok(!labels.includes('← 返回服务器列表'));
   assert.equal(tree.elements.some(node => node.type === 'select'), false, '列表视图不显示会话选择');
   assert.equal(tree.elements.some(node => node.type === 'textarea'), false, '列表视图不显示 JSON 编辑器');
@@ -207,10 +208,21 @@ test('双视图：默认只显示服务器列表，新增配置视图承载扫�
   const addTree = await renderSettings({ states: [draft, false, [], '', null, {}, {}, '', false, '', 'add'], configJson: draft });
   const addLabels = addTree.elements.filter(node => node.type === 'button').map(buttonLabel);
   assert.ok(addLabels.includes('← 返回服务器列表'), '可以返回列表');
-  assert.ok(addLabels.includes('扫描当前工作区'), '新增视图提供扫描');
-  assert.ok(addTree.elements.some(node => node.type === 'select' && node.props['aria-label'] === '工作区会话'), '工作区选择有无障碍标签');
-  assert.ok(addTree.elements.some(node => node.type === 'textarea'), '新增视图提供 JSON 编辑');
-  assert.ok(addTree.text.includes('新增 LSP 配置'));
+  assert.ok(addLabels.includes('重新扫描'), '新增视图提供扫描');
+  assert.ok(addTree.elements.some(node => node.type === 'select' && node.props['aria-label'] === '扫描范围会话'), '会话只是扫描范围，带无障碍标签');
+  assert.ok(addTree.text.includes('新增语言服务器'));
+  assert.ok(addTree.text.includes('选择语言服务器'), '新增视图先选服务器，而不是先看目录');
+  assert.ok(addTree.text.includes('加入配置'), '加入配置是新增视图的落点');
+  assert.equal(addTree.elements.some(node => node.type === 'textarea'), false, '新增视图不再承载 JSON 编辑');
+  assert.ok(addTree.text.includes('草稿里的服务器：mock'), '加入后能看到草稿里有哪些服务器');
+
+  // JSON 编辑是独立视图：只有它出现文本域。
+  const jsonTree = await renderSettings({ states: [draft, false, [], '', null, {}, {}, '', false, '', 'json'], configJson: draft });
+  const jsonLabels = jsonTree.elements.filter(node => node.type === 'button').map(buttonLabel);
+  assert.ok(jsonLabels.includes('← 返回服务器列表'));
+  assert.ok(jsonTree.elements.some(node => node.type === 'textarea'), 'JSON 视图提供文本域');
+  assert.ok(jsonTree.text.includes('编辑配置 JSON'));
+  assert.equal(jsonLabels.includes('重新扫描'), false, 'JSON 视图不掺扫描');
 });
 
 test('列表卡片：服务器设置详情、验证状态与评估目录标注', async () => {
@@ -221,7 +233,7 @@ test('列表卡片：服务器设置详情、验证状态与评估目录标注',
   // openServers 注入为展开第一项。
   const tree = await renderSettings({ states: [configJson, false, [], '', null, {}, { 0: true, 1: true }, '', false, ''], configJson });
   const labels = tree.elements.filter(node => node.type === 'button').map(buttonLabel);
-  assert.ok(labels.includes('＋ 新增配置'));
+  assert.ok(labels.includes('＋ 新增语言服务器'));
   assert.ok(tree.text.includes('服务器（2）'));
   assert.ok(tree.text.includes('未扫描'), '未扫描过的服务器如实标注');
   const cards = tree.elements.filter(node => node.type === 'article');
@@ -248,8 +260,12 @@ test('列表卡片：服务器设置详情、验证状态与评估目录标注',
   assert.ok(statusTree.text.includes('验证通过'), '验证通过的服务器有标注');
   assert.ok(statusTree.text.includes('验证失败'), '验证失败的服务器有标注');
   assert.ok(statusTree.text.includes('未验证'), '未参与验证的服务器如实标注');
-  assert.ok(statusTree.text.includes('2 项能力'));
+  // 能力检查只报人话：常用能力列一行，协议里的完整清单收进折叠区。
+  assert.ok(statusTree.text.includes('验证通过 · 支持 悬停、定义 · utf-16'), '能力摘要一眼能读');
+  assert.ok(statusTree.text.includes('全部能力（2）'), '完整能力清单折叠保留');
   assert.ok(statusTree.text.includes('hoverProvider'));
+  assert.equal(statusTree.text.includes('服务器信息：'), false, '不再把 serverInfo 原样倒进界面');
+  assert.ok(statusTree.text.includes('服务器：gopls'));
   assert.ok(statusTree.text.includes('Could not find a valid TypeScript installation'), '失败原因直接可见');
   assert.ok(statusTree.text.includes('尚未验证：本次未启动该服务器'));
   assert.ok(statusTree.text.includes('/ws'));
@@ -278,7 +294,7 @@ test('列表卡片：服务器设置详情、验证状态与评估目录标注',
   assert.ok(targetTree.text.includes('评估目录：/Users/voidmind/Documents/DSHplugins（随工作区与项目标记自动判定）'), '没有配置根目录时如实标注自动判定');
   assert.ok(targetTree.text.includes('沙箱缓存提示：'), '缓存目标不可写时在页面上给出原因');
   assert.ok(targetTree.text.includes('验证通过'), '其它项目的服务器也能验证');
-  assert.ok(targetTree.text.includes('1 项能力'));
+  assert.ok(targetTree.text.includes('支持 定义'), '能力摘要只列常用能力');
   const targetLabels = targetTree.elements.filter(node => node.type === 'button').map(buttonLabel);
   assert.equal(targetLabels.includes('切到该项目会话并验证'), false, '不再需要靠切换会话来验证');
 });
