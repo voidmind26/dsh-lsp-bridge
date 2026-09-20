@@ -107,6 +107,18 @@ dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 
 会话只承担两件事：**授权**（能否启动可信程序）与**未声明根目录时的默认目录**；代码查询（读取工作区文件）仍以会话工作区为边界。
 
+配置的根目录只做 canonicalize 与目录校验，允许落在会话工作区之外；`lsp` 的 `file`/`root` 属于调用方输入，仍必须落在会话工作区内（符号链接解析后同样如此）。因此当工作区里的文件不属于该服务器配置的任何项目根时，查询会明确报 `File is not covered by configured roots/workspaceFolders for <id>`，而不是含混的越界错误。
+
+### 项目根怎么定（三种模式）
+
+| 配置形状 | 带 `file` 的查询 | 无 `file` 的 `workspaceSymbols` |
+| --- | --- | --- |
+| 都不填（只有 `rootMarkers`） | 从文件所在目录就近找到项目标记 | 会话根目录为评估根，预热会打开各项目的文件 |
+| `roots: [A, B]`（固定评估，可跨工作区） | 按覆盖文件的最深根选主根 | 主根取最深的一个，但 A、B 都声明给服务器，因此两个仓都能查到 |
+| `roots: [A]`（钉住一个工程） | 只有 A 里的文件可用，B 报 `is not covered…` | 只覆盖 A |
+
+上面的行为用真实 gopls 在一个含两个独立 module 的工作区里实测过：不填根 / `workspaceFolders: [A,B]` / 修复后的 `roots: [A,B]` 都能在 `workspace/symbol` 里同时看到两个仓的符号，而钉住单根时只看到一个仓。选哪种取决于目的：**要"走到哪个工程查哪个工程"就不填根；要多仓一起评估就填 `workspaceFolders`（或 `roots`）；要在任意会话里固定查某个工程才用 `roots`。**
+
 **新增配置（右上角「＋ 新增配置」）**：独立的扫描与编辑视图，完成后点「← 返回服务器列表」。
 
 1. 在新增配置视图中选择一个当前活动会话；列表中的目录是服务端会话记录，不接受浏览器提交任意扫描路径。
@@ -129,9 +141,9 @@ UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现�
 | `command` / `args` | 可信程序与参数，不通过 shell 执行 |
 | `env` | 在进程环境上覆盖的字符串环境变量；勿提交凭据 |
 | `languages` | LSP languageId 到扩展名数组，如 `{"go":[".go"]}` |
-| `rootMarkers` | 向工作区边界逐级查找最近项目标记；找不到则使用会话根目录 |
-| `roots` | 显式项目根目录列表，按覆盖文件的最深目录选择 |
-| `workspaceFolders` | 显式发送给服务器的多根目录；相对路径以会话工作目录解析 |
+| `rootMarkers` | 不填 `roots` 时，从文件所在目录向工作区边界逐级查找最近项目标记；都找不到则使用会话根目录 |
+| `roots` | 固定评估的项目根目录列表（可跨工作区）；本次查询按覆盖文件的最深目录选主根，其余根一并声明给服务器 |
+| `workspaceFolders` | 显式声明给服务器的多根目录（多仓工作区）；相对路径以会话工作目录解析 |
 | `initializationOptions` | 原样传给 initialize |
 | `settings` | didChangeConfiguration 配置与 workspace/configuration 查询的数据源 |
 | `timeoutMs` | 单次协议请求超时，默认 15000，最高 300000 毫秒 |
@@ -146,7 +158,8 @@ UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现�
 ### 多目录语义
 
 - `uos` 不是单个 Go module。默认配置使用最近 `go.mod` 定位各项目，避免从顶层直接启动 gopls 导致找不到 module。
-- `roots` 不会把独立工程合并成一个工程。只有显式配置 `workspaceFolders` 才将多个目录传给服务，例如 `"workspaceFolders": ["qsl-game-server", "unityroomlib"]`。
+- `roots` 与 `workspaceFolders` 里的每个目录都会作为 `workspaceFolders` 声明给服务器（一个实例服务全部声明的根），主根按覆盖本次文件的最深目录选；因此多仓工作区能用一个进程覆盖多个仓。
+- `lsp_setup configure` **不把扫描到的项目根写进配置**（只写命令、参数、语言与 `rootMarkers`）：扫描结果是"当前会话里的事实"，写成绝对路径会在换机器/换检出目录后失效，而且会把无 file 的工作区符号查询缩小到一个仓。需要固定评估某个工程时才手工填 `roots`；想让服务器回到"随工作区自动判定"，把它写成 `roots: []`。
 - 多根并不自动修复依赖：跨仓定义是否定位到本地共享库仍取决于 go.work / replace、tsconfig project references 等。插件不自动改写这些文件，也不保证每个服务器支持多根。
 - 显式 roots 中的目录必须存在；如果仅检出部分 uos 仓库，删去缺失目录或使用通用 rootMarkers 示例。
 - 工作区符号只查询选中的一个实例，不自动聚合所有语言和所有项目；明确传入 server + root。
@@ -164,7 +177,7 @@ UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现�
 
 `workspaceSymbols` 没有文件可推断语言，因此插件会先按“是否覆盖当前工作区”自动选择服务器，只有多个服务器都覆盖时才要求显式传 `server`。指定 `server` 时始终按指定服务器查询。
 
-冷启动时插件会先做一次**有界预热**：在服务器项目根目录内（深度 ≤ 2、最多 200 个目录项、最多 24 个语言匹配文件，跳过依赖/构建目录与符号链接）打开匹配文件，让服务器建立项目。这解决了 TypeScript 上 `workspace/symbol` 报 `No Project.` 或返回空结果的问题。预热只在实例还没有任何已打开文档时执行，代价一次。
+冷启动时插件会先做一次**有界预热**：在服务器**自己的项目根**内（深度 ≤ 2、最多 200 个目录项、最多 24 个语言匹配文件，跳过依赖/构建目录与符号链接）打开匹配文件，让服务器建立项目。读取的包含性基准是这个项目根，而不是会话工作区——配置在别的工程下的服务器同样需要预热，否则 TypeScript 会在 `workspace/symbol` 上直接报 `No Project.`。预热只在实例还没有任何已打开文档时执行，代价一次。
 
 ## 安全与生命周期
 
@@ -206,7 +219,7 @@ npm test
 LSP_TEST_GOPLS=/Users/voidmind/go/bin/gopls npm test
 ```
 
-测试按主题组织，**同一主题的断言合并在一个用例里**（当前 52 个用例，覆盖模拟 stdio 分帧、多根与独立项目路由、UTF-16 参数、磁盘内容同步、符号/诊断、路径与符号链接边界、扫描限制与 PATH 处理、配置与权限门控、会话常驻与回收、安装/配置/验证流程、客户端契约与双视图）。新增覆盖请并入对应主题的现有用例，不要为同一行为再开一个用例。真实 gopls 测试默认跳过，设置 `LSP_TEST_GOPLS` 才执行。没有为此运行 uos 业务服务或修改其中代码。
+测试按主题组织，**同一主题的断言合并在一个用例里**（当前 54 个用例，覆盖模拟 stdio 分帧、多根与独立项目路由、UTF-16 参数、磁盘内容同步、符号/诊断、路径与符号链接边界、扫描限制与 PATH 处理、配置与权限门控、会话常驻与回收、安装/配置/验证流程、客户端契约与双视图）。新增覆盖请并入对应主题的现有用例，不要为同一行为再开一个用例。真实 gopls 测试默认跳过，设置 `LSP_TEST_GOPLS` 才执行。没有为此运行 uos 业务服务或修改其中代码。
 
 实现入口：`src/index.js`（DSH 适配）、`src/pool.js`（会话常驻池与生命周期）、`src/engine.js`（路由与 LSP 会话）、`src/transport.js`（JSON-RPC stdio）；设计见 `docs/design.md`。
 

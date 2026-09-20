@@ -1,6 +1,6 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, realpath, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, realpath, chmod, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CATALOG } from '../src/catalog.js';
@@ -12,8 +12,13 @@ import { runSetup, validateSetupArgs } from '../src/index.js';
 
 const tsServer = () => catalogServer('typescript-language-server').server;
 
+/** 每个临时工作区都登记在这里，用例结束后统一删除，避免在 TMPDIR 里堆积。 */
+const temporaryRoots = [];
+after(async () => { for (const root of temporaryRoots) await rm(root, { recursive: true, force: true }); });
+
 async function workspaceWith(files = []) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'lsp-setup-')));
+  temporaryRoots.push(root);
   for (const file of files) {
     await mkdir(join(root, file, '..'), { recursive: true });
     await writeFile(join(root, file), '{}');
@@ -158,15 +163,21 @@ test('配置合并与写入范围：保留未知字段、按 id 覆盖、拒绝�
   // 只有依赖齐备的服务器才会写入配置。
   const diagnosis = {
     servers: [
-      { serverId: 'gopls', status: 'ready', command: '/bin/gopls', args: [], languages: { go: ['.go'] }, rootMarkers: ['go.mod'], roots: ['/w'], dependencies: [] },
+      { serverId: 'gopls', status: 'ready', command: '/bin/gopls', args: [], languages: { go: ['.go'] }, rootMarkers: ['go.mod'], roots: ['/w'], targetSource: 'config', dependencies: [] },
       { serverId: 'typescript-language-server', status: 'missing-dependency', command: '/bin/tls', args: ['--stdio'], languages: {}, rootMarkers: [], roots: [], dependencies: [{ satisfied: false }] },
-      { serverId: 'pyright', status: 'ready', command: '/bin/pyright-langserver', args: ['--stdio'], languages: {}, rootMarkers: [], roots: [], dependencies: [], initializationOptions: { python: { analysis: {} } } },
+      { serverId: 'pyright', status: 'ready', command: '/bin/pyright-langserver', args: ['--stdio'], languages: {}, rootMarkers: [], roots: ['/repo/py'], targetSource: 'session', dependencies: [], initializationOptions: { python: { analysis: {} } } },
     ],
   };
   const servers = configServersFromDiagnosis(diagnosis);
   assert.deepEqual(servers.map(server => server.id), ['gopls', 'pyright']);
   assert.deepEqual(servers[1].initializationOptions, { python: { analysis: {} } });
   assert.deepEqual(configServersFromDiagnosis(diagnosis, { servers: ['gopls'] }).map(server => server.id), ['gopls']);
+  // 项目根不落盘：扫描到的根（targetSource=session）不写进配置，配置里本来就有的根原样保留。
+  assert.deepEqual(servers[0].roots, ['/w'], '显式配置的 roots 保留');
+  assert.deepEqual(servers[1].roots, [], '扫描到的项目根不写进配置');
+  // 写空数组是刻意的：合并是字段级覆盖，省略 roots 会保留旧值，用户就再也摘不掉固定根。
+  const stale = JSON.stringify({ servers: [{ id: 'pyright', command: '/bin/pyright-langserver', roots: ['/old/project'] }] });
+  assert.deepEqual(JSON.parse(mergeServersIntoConfig(stale, [servers[1]])).servers[0].roots, [], '可以把服务器改回“随工作区自动判定”');
 });
 
 test('PATH 未提供命令时，插件自己安装的前缀可以补位', async () => {
@@ -189,6 +200,45 @@ test('PATH 未提供命令时，插件自己安装的前缀可以补位', async 
   const healedEntry = healed.servers.find(server => server.serverId === 'typescript-language-server');
   assert.equal(healedEntry.status, 'ready', '命令与运行组件齐备后必须判定为可用');
   assert.equal(healedEntry.initializationOptions.tsserver.path, join(await realpath(join(prefix, 'typescript-language-server', 'node_modules', 'typescript')), 'lib', 'tsserver.js'));
+
+  // 安装目录与工作区没有关系：前缀在工作区外、且程序只写在配置里的名字时，同样必须补位。
+  const outsideWorkspace = await workspaceWith([]);
+  const outsidePrefix = await workspaceWith([]);
+  const outsideBinary = join(outsidePrefix, 'gopls', 'bin', 'gopls');
+  await mkdir(join(outsideBinary, '..'), { recursive: true });
+  await writeFile(outsideBinary, '#!/bin/sh\n');
+  await chmod(outsideBinary, 0o755);
+  const outsideDiagnosis = await diagnoseWorkspace({
+    workspace: outsideWorkspace,
+    env: { PATH: '/nonexistent' },
+    platform: 'darwin',
+    install: { directory: outsidePrefix, enabled: false },
+    configured: [{ id: 'gopls', command: 'gopls', args: [], languages: { go: ['.go'] }, roots: [outsideWorkspace] }],
+  });
+  const outsideEntry = outsideDiagnosis.servers.find(server => server.serverId === 'gopls');
+  assert.equal(outsideEntry.command, await realpath(outsideBinary), '前缀在工作区外同样补位');
+  assert.equal(outsideEntry.commandSource, 'plugin');
+  assert.equal(outsideEntry.status, 'ready');
+  assert.equal(outsideEntry.target, await realpath(outsideWorkspace), '评估目标仍由配置根决定');
+
+  // 程序装在目标工程自己的 node_modules/.bin 里（与工作区无关），同样必须找得到。
+  const projectWorkspace = await workspaceWith([]);
+  const projectRoot = await workspaceWith([]);
+  const projectBinary = join(projectRoot, 'node_modules', '.bin', 'gopls');
+  await mkdir(join(projectBinary, '..'), { recursive: true });
+  await writeFile(projectBinary, '#!/bin/sh\n');
+  await chmod(projectBinary, 0o755);
+  const projectDiagnosis = await diagnoseWorkspace({
+    workspace: projectWorkspace,
+    env: { PATH: '/nonexistent' },
+    platform: 'darwin',
+    install: { directory: join(projectWorkspace, 'empty-prefix'), enabled: false },
+    configured: [{ id: 'gopls', command: 'gopls', args: [], languages: { go: ['.go'] }, roots: [projectRoot] }],
+  });
+  const projectEntry = projectDiagnosis.servers.find(server => server.serverId === 'gopls');
+  assert.equal(projectEntry.command, await realpath(projectBinary), '目标工程本地的可执行文件也能补位');
+  assert.equal(projectEntry.commandSource, 'project');
+  assert.equal(projectEntry.status, 'ready');
 });
 
 test('验证：只针对齐备服务器、逐个报告成败、可被打断、数量上限，且在服务器自己的目标目录内执行', async () => {
@@ -309,6 +359,29 @@ test('诊断按服务器自己的项目目录进行，不绑定会话工作区',
   assert.equal(custom.language, 'custom');
   assert.equal(custom.install.available, false);
   assert.equal(custom.install.reason, 'no-portable-installer');
+
+  // 同一 id 既被发现又被配置时以配置为准：查询实际用的是配置根，评估目标不能退回会话工作区。
+  await writeFile(join(workspace, 'go.mod'), '{}');
+  const localBinary = join(workspace, 'node_modules', '.bin', 'gopls');
+  await mkdir(join(localBinary, '..'), { recursive: true });
+  await writeFile(localBinary, '#!/bin/sh\n');
+  await chmod(localBinary, 0o755);
+  // HOME 指向空目录：不让本机 ~/go/bin 里的 gopls 干扰“发现的命令”这一断言。
+  const home = await workspaceWith([]);
+  const shadowed = await diagnoseWorkspace({
+    workspace,
+    env: { PATH: '/nonexistent', HOME: home },
+    platform: 'darwin',
+    install: { directory: join(workspace, 'no-prefix'), enabled: false },
+    configured: [{ id: 'gopls', command: 'gopls-not-on-path', args: [], languages: { go: ['.go'] }, roots: [outsideRoot] }],
+  });
+  const goplsEntries = shadowed.servers.filter(server => server.serverId === 'gopls');
+  assert.equal(goplsEntries.length, 1, '同一 id 只出一个条目');
+  assert.equal(goplsEntries[0].targetSource, 'config');
+  assert.equal(goplsEntries[0].target, outsideRoot, '评估目标来自配置的项目根，而不是会话工作区');
+  assert.deepEqual(goplsEntries[0].roots, [outsideRoot]);
+  assert.equal(goplsEntries[0].command, await realpath(localBinary), '发现到的命令只作兜底，不改变评估目标');
+  assert.equal(goplsEntries[0].status, 'ready');
 });
 
 test('lsp_setup：参数白名单，以及 auto/install/configure 的成功、降级与失败路径', async () => {

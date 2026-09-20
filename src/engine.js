@@ -51,6 +51,19 @@ async function safePath(workspace, candidate, directory = false) {
   return resolved;
 }
 
+/**
+ * 配置的 roots/workspaceFolders 是管理员配置，按设计允许落在会话工作区之外。
+ * 这里只做 canonicalize 与目录校验；工作区包含性断言是给调用方传入的 file/root 用的。
+ */
+async function configuredRoot(workspace, candidate) {
+  if (typeof candidate !== 'string' || !candidate) throw new Error('Expected a non-empty path');
+  const lexical = path.resolve(workspace, candidate);
+  let resolved;
+  try { resolved = await realpath(lexical); } catch (error) { throw new Error(`Cannot resolve path ${candidate}: ${error.message}`); }
+  if (!(await stat(resolved)).isDirectory()) throw new Error(`Not a directory: ${candidate}`);
+  return resolved;
+}
+
 function queued(instance, fn, signal) {
   checkAbort(signal);
   if ((instance.queuedCount || 0) >= 256) throw new Error('Too many queued LSP operations');
@@ -132,8 +145,10 @@ export class LspManager {
   }
 
   async rootFor(server, workspace, file, explicit) {
-    const roots = await Promise.all((server.roots || []).map(root => safePath(workspace, root, true)));
-    const folders = await Promise.all((server.workspaceFolders || []).map(root => safePath(workspace, root, true)));
+    // 配置的根目录只做 canonicalize 与目录校验：它按设计可以指向别的工程。
+    // 调用方传入的 explicit/file 仍走 safePath，越界（含符号链接穿越）继续被拒绝。
+    const roots = await Promise.all((server.roots || []).map(root => configuredRoot(workspace, root)));
+    const folders = await Promise.all((server.workspaceFolders || []).map(root => configuredRoot(workspace, root)));
     let root;
     if (explicit !== undefined) root = await safePath(workspace, explicit, true);
     else if (roots.length || folders.length) {
@@ -158,7 +173,11 @@ export class LspManager {
       }
     }
     if (file && !inside(root, file) && !folders.some(folder => inside(folder, file))) throw new Error('File is outside selected root and workspaceFolders');
-    return { root, folders: [...new Set([root, ...folders])] };
+    // 声明给服务器的多根目录：所有配置的 roots/workspaceFolders 一起声明，再加上本次选中的根。
+    // 多仓工作区里因此一个实例就覆盖全部仓——无 file 的工作区符号查询不会只落在一个仓上；
+    // 排序保证同样的根集合得到稳定的实例键（与本次选中哪个根无关）。
+    const declared = [...new Set([...roots, ...folders, root])].sort();
+    return { root, folders: declared };
   }
 
   /**
@@ -210,8 +229,13 @@ export class LspManager {
   /**
    * 冷实例上的工作区符号查询先打开几个代表文件，让服务器建立项目。
    * 有已打开文档时不重复预热：用户自己查过的目录已经在项目里了。
+   *
+   * 读取的包含性基准是**服务器自己的项目根**（配置来源，按设计允许在会话工作区之外），
+   * 而不是会话工作区：否则配置在别的工程下的服务器永远预热不到任何文件，
+   * tsserver 这类靠打开文件建立项目的服务器会直接失败（`No Project.`）。
+   * 调用方传入的 `file` 仍以会话工作区为边界（见 execute 与 readDocument 的调用点）。
    */
-  async warmup(server, instance, workspace, signal) {
+  async warmup(server, instance, signal) {
     if (instance.documents.size > 0) return 0;
     const candidates = await this.warmupFiles(server, instance.root, signal);
     let opened = 0;
@@ -220,7 +244,7 @@ export class LspManager {
       checkAbort(signal);
       let text;
       try {
-        text = await this.readDocument(workspace, candidate);
+        text = await this.readDocument(instance.root, candidate);
       } catch (error) {
         // 预热是尽力而为：单个文件过大或不可读时跳过，不能让整次查询失败。
         if (signal?.aborted) throw error;
@@ -496,7 +520,7 @@ export class LspManager {
       if (this.disposed) throw new Error('LSP manager is disposed');
       // 预热必须在打开目标文件之前：warmup 以“已有打开文档”为跳过条件，
       // 而 rename 会先 didOpen 目标文件，晚于它调用就等于没有预热。
-      if (operation === 'workspaceSymbols' || operation === 'rename') await this.warmup(server, instance, workspace, signal);
+      if (operation === 'workspaceSymbols' || operation === 'rename') await this.warmup(server, instance, signal);
       let uri, text;
       if (file) {
         text = await this.readDocument(workspace, file);
@@ -561,11 +585,6 @@ export class LspManager {
 }
 
 /**
- * 用一次性 manager 真实启动一个服务器，完成 initialize 后立即关闭。
- * 用于安装后验证“能找到程序”确实等于“能工作”；不保留任何常驻实例。
- * 失败时抛出包含服务器 stderr 的错误，便于直接展示原因。
- */
-/**
  * 同目录临时文件 + rename 的原子替换：避免写到一半失败把源文件截断。
  * 保留原文件权限；失败时清理临时文件。
  */
@@ -597,12 +616,28 @@ async function writeFileAtomic(file, text) {
   }
 }
 
+/**
+ * 用一次性 manager 真实启动一个服务器，完成 initialize 后立即关闭。
+ * 用于安装后验证“能找到程序”确实等于“能工作”；不保留任何常驻实例。
+ * 失败时抛出包含服务器 stderr 的错误，便于直接展示原因。
+ * `root` 是配置/诊断来源的项目目录（与 `roots`/`workspaceFolders` 同信任级别），
+ * 因此可以落在会话工作区之外；调用方传入的路径不经过这里。
+ */
 export async function probeLanguageServer({ server, workspace, root, timeoutMs = 15000, signal, confine, env } = {}) {
   // 探针只做 initialize 验证：writeMode 固定为 deny，服务器即使请求 applyEdit 也不会改文件。
   const manager = new LspManager({ servers: [server], timeoutMs, maxInstances: 1, confine, sandboxEnv: env, writeMode: 'deny' });
   try {
     const parsed = manager.servers[0];
-    const resolved = await manager.rootFor(parsed, workspace, undefined, root === undefined ? undefined : root);
+    let resolved;
+    if (root === undefined) {
+      resolved = await manager.rootFor(parsed, workspace, undefined, undefined);
+    } else {
+      // 探针的 root 是配置/诊断来源的项目目录（例如诊断条目的 target），不是调用方输入，
+      // 因此与 roots/workspaceFolders 同一信任级别：只 canonicalize，允许落在会话工作区之外。
+      const target = await configuredRoot(workspace, root);
+      const extra = await Promise.all((parsed.workspaceFolders || []).map(folder => configuredRoot(workspace, folder)));
+      resolved = { root: target, folders: [...new Set([target, ...extra])] };
+    }
     const instance = await manager.instanceFor(parsed, workspace, resolved.root, resolved.folders, signal);
     return {
       root: resolved.root,

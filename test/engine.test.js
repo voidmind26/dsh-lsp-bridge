@@ -62,6 +62,60 @@ test('工作区符号按覆盖范围自动选择服务器，只有都覆盖时�
   assert.equal(explicit[0].name, 'Example', '显式指定时始终按指定服务器查询');
 });
 
+test('配置的 roots 在会话工作区外：按项目运行，调用方路径仍受工作区约束', async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-config-root-')));
+  const project = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-other-project-')));
+  await writeFile(join(workspace, 'sample.mock'), 'workspace file');
+  await writeFile(join(project, 'main.mock'), 'project file');
+  // 工作区内的符号链接指向配置的项目目录：realpath 之后仍在工作区之外。
+  await symlink(project, join(workspace, 'escape'));
+  const server = { id: 'mock', command: process.execPath, args: [mock], languages: { mock: ['.mock'] }, roots: [project] };
+  const manager = new LspManager({ timeoutMs: 1000, servers: [server] });
+  t.after(async () => { await manager.dispose(); await rm(workspace, { recursive: true, force: true }); await rm(project, { recursive: true, force: true }); });
+  const run = args => manager.execute(args, { workspace });
+
+  // 工作区内的 file + 配置的根在工作区外：没有候选根，必须报“未被配置根覆盖”。
+  // 这里同时钉住另一件事：不能再用给调用方路径准备的工作区断言去判配置的根。
+  await assert.rejects(run({ operation: 'diagnostics', file: 'sample.mock' }), error => {
+    assert.match(error.message, /is not covered by configured roots\/workspaceFolders for mock/);
+    assert.doesNotMatch(error.message, /Path resolves outside workspace/);
+    return true;
+  });
+
+  // 没有 file：对着配置的那个工程运行（README: 不需要切到该项目的会话）。
+  assert.equal((await run({ operation: 'workspaceSymbols', query: 'Add' }))[0].name, 'Add');
+  const [instance] = (await run({ operation: 'status' })).instances;
+  assert.equal(instance.root, project, '评估目标是配置的项目目录');
+  assert.deepEqual(instance.workspaceFolders, [project]);
+  // 预热读取的基准是服务器自己的项目根：配置在别的工程下时也必须能打开那里的文件，
+  // 否则 tsserver 这类靠打开文件建项目的服务器会直接失败（No Project.）。
+  assert.ok(instance.documents >= 1, '预热读取不再被会话工作区边界挡住');
+
+  const { probeLanguageServer } = await import('../src/engine.js');
+  // 探针的 root 来自配置/诊断，允许在工作区外（lsp_setup verify 的场景）。
+  assert.equal((await probeLanguageServer({ server, workspace, root: project, timeoutMs: 1000 })).root, project);
+  // 多根配置：诊断条目会把所有根都交给探针，第二个根不在第一个根内也不再失败。
+  const probed = await probeLanguageServer({ server: { ...server, roots: [project, workspace] }, workspace: project, timeoutMs: 1000 });
+  assert.ok([project, workspace].includes(probed.root), '多根配置下探针仍能完成 initialize');
+
+  // 多仓：roots 里的每个仓都要作为 workspaceFolders 声明给服务器，
+  // 否则无 file 的工作区符号查询只落在一个仓上（后面的仓查不到符号）。
+  const second = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-second-project-')));
+  await writeFile(join(second, 'other.mock'), 'second project');
+  const multiManager = new LspManager({ timeoutMs: 1000, servers: [{ ...server, roots: [project, second] }] });
+  t.after(async () => { await multiManager.dispose(); await rm(second, { recursive: true, force: true }); });
+  await multiManager.execute({ operation: 'workspaceSymbols', query: 'Add' }, { workspace });
+  const [multiInstance] = (await multiManager.execute({ operation: 'status' }, { workspace })).instances;
+  assert.deepEqual(multiInstance.workspaceFolders, [project, second].sort(), '多仓全部声明给服务器');
+  assert.ok([project, second].includes(multiInstance.root), '主根是覆盖查询目标的那个仓');
+  assert.ok(multiInstance.documents >= 1, '预热在主根里打开代表文件');
+
+  // 反向回归：调用方传入的 file/root 逃出工作区（含符号链接穿越）必须继续被拒绝。
+  await assert.rejects(run({ operation: 'workspaceSymbols', root: project }), /Path resolves outside workspace/);
+  await assert.rejects(run({ operation: 'diagnostics', file: join(project, 'main.mock') }), /Path resolves outside workspace/);
+  await assert.rejects(run({ operation: 'diagnostics', file: 'escape/main.mock' }), /Path resolves outside workspace/);
+});
+
 test('写入操作：dry-run 不改盘，apply 真正落盘，只读与工作区外按权限拒绝', async t => {
   const workspace = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-write-')));
   await writeFile(join(workspace, 'main.mock'), 'original name\n');

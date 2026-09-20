@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LspSessionPool } from '../src/pool.js';
+import { LspSessionPool, sandboxCacheWarning, unwritableCacheTargets } from '../src/pool.js';
 
 function setup(t, maxSessions = 1, mode = { value: 'danger-full-access' }) {
   const managers = [];
@@ -52,6 +52,30 @@ test('没有可用沙箱后端时，受限会话在创建实例之前就失败�
   t.after(() => bare.dispose());
   await assert.rejects(bare.execute({}, { session: {}, workspace: '/test' }), /sandbox backend/);
   assert.deepEqual(created, []);
+});
+
+test('受限会话的缓存目标不可写时给出结构化提示，而不是等服务器写缓存失败', async t => {
+  const policy = { mode: 'workspace-write', workspaceRoot: '/ws' };
+  const options = { env: {}, tmpdir: '/tmp' };
+  assert.equal(sandboxCacheWarning({ redirectCaches: false, cacheDirectory: '/elsewhere' }, policy, options), null, '关闭重定向时不提示');
+  assert.equal(sandboxCacheWarning({ redirectCaches: true, cacheDirectory: '/ws/cache' }, policy, options), null, '工作区内的目录不提示');
+  assert.equal(sandboxCacheWarning({ redirectCaches: true, cacheDirectory: '/tmp/lsp-bridge' }, policy, options), null, '临时目录不提示');
+  assert.match(sandboxCacheWarning({ redirectCaches: true, cacheDirectory: '/ro/cache' }, policy, options), /可写范围之外：GOCACHE\/GOTMPDIR\/XDG_CACHE_HOME=\/ro\/cache（来自sandbox\.cacheDirectory）/, '同一目录只列一次，并说明来源');
+  // 环境里已有的缓存变量插件按“管理员显式设置优先”不覆盖，但同样要提示。
+  const inherited = sandboxCacheWarning({ redirectCaches: true, cacheDirectory: '/tmp/ok' }, policy, { env: { GOCACHE: '/Library/Caches/go-build' }, tmpdir: '/tmp' });
+  assert.match(inherited, /GOCACHE=\/Library\/Caches\/go-build（来自环境变量）/);
+  assert.deepEqual(unwritableCacheTargets({ redirectCaches: true, cacheDirectory: '/ro/cache' }, policy, options), [
+    { key: 'GOCACHE', target: '/ro/cache', source: 'config' },
+    { key: 'GOTMPDIR', target: '/ro/cache', source: 'config' },
+    { key: 'XDG_CACHE_HOME', target: '/ro/cache', source: 'config' },
+  ], '重定向目标落在范围外时逐项报告');
+
+  // 池按会话策略给出同一提示；完全访问会话不使用沙箱缓存重定向，因此不提示。
+  const restricted = new LspSessionPool({ idleTimeoutMs: 60000, maxSessions: 1 }, () => policy, { sandbox: { redirectCaches: true, cacheDirectory: '/ro/cache' }, sandboxConfine: argv => ({ argv }), hasSandbox: () => true });
+  const full = new LspSessionPool({ idleTimeoutMs: 60000, maxSessions: 1 }, () => ({ mode: 'danger-full-access', workspaceRoot: '/ws' }), { sandbox: { redirectCaches: true, cacheDirectory: '/ro/cache' } });
+  t.after(async () => { await restricted.dispose(); await full.dispose(); });
+  assert.match(restricted.cacheWarning({}), /可写范围/);
+  assert.equal(full.cacheWarning({}), null);
 });
 
 test('权限模式变化会换掉实例，不让旧执行计划继续生效', async t => {

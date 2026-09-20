@@ -6,7 +6,8 @@ import { CATALOG } from './catalog.js';
 const DEFAULT_LIMITS = Object.freeze({ maxDepth: 6, maxDirectories: 5000, maxProjects: 256, deadlineMs: 2000 });
 const HARD_LIMITS = Object.freeze({ maxDepth: 32, maxDirectories: 100000, maxProjects: 4096, deadlineMs: 30000 });
 const SKIPPED_DIRECTORIES = new Set(['.git', 'node_modules', 'vendor', 'dist', 'build', 'target', 'out', 'cache', '.cache', 'venv', '.venv']);
-const WORKSPACE_BIN_DIRECTORIES = Object.freeze(['node_modules/.bin', '.venv/bin', 'venv/bin', '.cargo/bin']);
+/** 项目本地可执行文件目录：扫描会话工作区与解析配置项命令时共用同一份清单。 */
+export const WORKSPACE_BIN_DIRECTORIES = Object.freeze(['node_modules/.bin', '.venv/bin', 'venv/bin', '.cargo/bin']);
 const MAX_DIRECTORY_ENTRIES = 100000;
 
 const inside = (base, target) => {

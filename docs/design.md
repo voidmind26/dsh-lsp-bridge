@@ -30,7 +30,7 @@ uos 示例包含多个独立 Go module 与 Vue 工程；默认按 module 隔离�
 
 - 诊断（`status`）复用发现结果，并额外判断服务器的运行组件。判断的是“能不能工作”，不是“文件存不存在”：TypeScript 语言服务器必须能找到 `typescript/lib/tsserver.js`；`typescript` 包存在但没有该入口（例如 TypeScript 7）仍判为不可用，并给出原因。
 - 安装声明固定在 `src/catalog.js`：每种服务器声明安装方式（npm/go/cargo/venv/rustup/brew）、包名或组件名、以及安装后的可执行文件位置。调用方只能选择服务器 ID，不能提供命令、参数、包名或路径。
-- 前缀式安装（npm/go/cargo/venv）落在插件私有目录，默认 `$DSH_HOME/lsp-bridge/<serverId>`，不修改业务工程。安装后若 PATH 中没有该命令，插件前缀中的可执行文件可以直接补位。
+- 前缀式安装（npm/go/cargo/venv）落在插件私有目录，默认 `$DSH_HOME/lsp-bridge/<serverId>`，不修改业务工程。安装后的可执行文件按“越贴近这台服务器越好”的顺序解析：配置里的绝对路径 → PATH → 目标工程自己的 `node_modules/.bin` 等 → 插件前缀。这四种位置都与会话工作区无关（前缀与目标工程都可能在工作区外），因此在工作区内外的判断必须一致，且都要用同一份 `WORKSPACE_BIN_DIRECTORIES` 清单。
 - 安装命令不经 shell、不使用 sudo；只在 `install`/`auto` 且显式 `apply=true` 时执行；`status` 与 `verify` 永不安装。Windows 的前缀安装只产生 `.cmd` 包装器，当前明确声明不支持。
 - 写入配置走 `settings` 命名空间的 `scope.update({ configJson })`，并在写入后读回比对；不一致即报失败，不掩盖并发修改。缺少 `settings` 服务时明确拒绝写入。
 - 验证（`verify`）用一次性 manager 真实启动服务器完成 `initialize` 后立即关闭，返回 serverInfo 与能力；失败时直接暴露服务器 stderr，便于区分“缺少 SDK”“版本不兼容”“权限不足”等原因。
@@ -52,7 +52,12 @@ Host 通过 `systemPrompt.context` 注入一个短片段，让模型不必先猜
 
 - **授权**按会话：DSH 的 sandbox policy 属于会话，`lsp`、`lsp_setup` 与发现接口都要求目标会话为 `danger-full-access`，不自动提权。
 - **评估目标**按项目：一条配置的 `roots`/`workspaceFolders` 就是该服务器的项目目录，诊断与验证都在那里进行；没有显式根目录时才回落到会话工作区。目标目录只来自管理员配置，调用方（含浏览器）不能提交任意路径。
-- **代码查询**按会话工作区：读取文件、解析根目录仍受 `realpath` 工作区包含检查约束，模型不能借配置里的根目录越界读取其它工程的源码。
+- **代码查询**按会话工作区：读取的文件必须落在会话工作区内（`realpath` 包含检查，符号链接解析后同样适用），模型不能借配置里的根目录越界读取其它工程的源码。
+- **两类路径的信任级别不同**：配置的 `roots`/`workspaceFolders` 是管理员来源，只做 canonicalize 与目录校验，允许落在会话工作区之外；调用方传入的 `file`/`root` 必须经过工作区包含检查，越界即拒绝。当会话工作区内的文件不属于该服务器配置的任何项目根时，错误是 `File is not covered by configured roots/workspaceFolders for <id>`，而不是含混的越界报错。
+- **同一 id 的配置项优先于发现项**：查询实际使用配置声明的 `roots`/`workspaceFolders`（`rootFor` 优先配置根），所以状态与验证的评估目标必须取自配置条目；发现路径找到的命令（PATH、工作区的 `node_modules/.bin`、插件安装前缀）只作为命令兜底，不改变评估目标。
+- **项目根有三种来源，默认不落盘**：`roots`（固定评估某个工程，可跨工作区）→ `workspaceFolders`（多仓一起声明）→ 都不填时按文件位置逐级找最近的 `rootMarkers`、再回落到会话工作区。`lsp_setup configure` 只把**配置里本来就有的** `roots` 回写；扫描到的项目根写成 `roots: []`（而不是省略）——合并是字段级覆盖，省略会保留旧值，用户就再也摘不掉固定根，而冻结的绝对路径换机器即失效。
+- **多仓 = 一个实例声明多个根**：`rootFor` 把配置里所有 `roots`/`workspaceFolders` 连同本次选中的主根一起作为 `workspaceFolders` 声明（排序后作为实例键的一部分）。主根仍是覆盖本次文件的最深目录（无 file 时取最深的候选），因此每个仓的查询各有一个主根，但实例声明的是全部根，无 file 的工作区符号查询不会只落在一个仓上。
+- **预热的读取基准是服务器自己的项目根**，不是会话工作区：否则配置在别的工程下的服务器永远打不开任何文件，tsserver 这类靠打开文件建立项目的服务器会直接失败（`No Project.`）。调用方传入的 `file` 不受影响，仍以会话工作区为边界。
 
 因此一台指向别的仓库的服务器（例如 gopls）在任何会话里都能被诊断与验证，而它的文件访问仍需要在该项目下的会话来使用。
 
@@ -75,6 +80,7 @@ Host 通过 `systemPrompt.context` 注入一个短片段，让模型不必先猜
 - `danger-full-access`：直接启动（用户已明确授权无沙箱执行）。
 - 其它模式：先调用 `ctx.sandbox.confine(argv, policy)` 包装 argv，使服务器进程接受与会话相同的文件约束（macOS seatbelt：可读全部、允许网络、只允许写工作区与临时目录）。缓存类环境变量（`GOCACHE`/`GOTMPDIR`/`XDG_CACHE_HOME`）重定向到临时目录，避免服务器因写缓存被拒而失败。
 - `confine` 抛 `SANDBOX_UNAVAILABLE` 或部署未加载沙箱服务时**失败关闭**，绝不无沙箱启动；`read-only` 模式没有任何可写根，部分服务器会因此失败，错误中给出提示。
+- 缓存目标与沙箱可写范围不一致时**先报告**：`sandbox.cacheDirectory`（或环境里已有、插件按“管理员显式设置优先”不覆盖的 `GOCACHE` 等）若落在会话工作区与 `/tmp`、`os.tmpdir()` 之外，`lsp_setup` 的 `nextActions` 与设置页都会在启动服务器之前说明原因，而不是等服务器以“写被拒”失败。这里只报告不改变行为。
 - 已用等价的 seatbelt profile（`writableRoots` = 工作区 + `/tmp` + canonical `os.tmpdir()`）实测：`typescript-language-server` 返回 413 个文档符号、`gopls` 返回 100 个工作区符号，均在沙箱内正常工作。tsserver 会在 `os.tmpdir()` 下建临时目录，因此该根必须可写（DSH 的 `writableRoots` 已包含它）。
 - 安装命令仍要求 `danger-full-access`：安装器在插件进程内直接执行，不经过会话沙箱，因此不能用受限会话的权限去装软件。
 

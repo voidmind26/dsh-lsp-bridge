@@ -79,7 +79,7 @@ test('真实发现报告生成配置：ready 与人工候选生效，缺组件�
   const report = {
     projects: [{ language: 'go', root: '/repo/go', markers: ['go.mod'] }], complete: true,
     servers: [
-      { language: 'go', serverId: 'gopls', roots: ['/repo/go'], args: [], languages: { go: ['.go'] }, rootMarkers: ['go.mod'], status: 'ready', command: '/usr/bin/gopls', candidates: [], dependencies: [] },
+      { language: 'go', serverId: 'gopls', roots: ['/repo/go'], args: [], languages: { go: ['.go'] }, rootMarkers: ['go.mod'], status: 'ready', command: '/usr/bin/gopls', candidates: [], dependencies: [], targetSource: 'config' },
       { language: 'tsjs', serverId: 'typescript-language-server', roots: ['/repo/js'], args: ['--stdio'], languages: { typescript: ['.ts'] }, rootMarkers: ['package.json'], status: 'ready', command: '/a/tsls', candidates: [], dependencies: [], initializationOptions: { tsserver: { path: '/a/node_modules/typescript/lib/tsserver.js' } } },
       { language: 'python', serverId: 'pyright', roots: ['/repo/py'], args: ['--stdio'], languages: { python: ['.py'] }, rootMarkers: ['pyproject.toml'], status: 'missing-command', candidates: [], dependencies: [], installAdvice: 'npm i -g pyright' },
       { language: 'rust', serverId: 'rust-analyzer', roots: ['/repo/rs'], args: [], languages: { rust: ['.rs'] }, rootMarkers: ['Cargo.toml'], status: 'missing-dependency', candidates: [], dependencies: [{ id: 'typescript-sdk', satisfied: false }] },
@@ -93,6 +93,9 @@ test('真实发现报告生成配置：ready 与人工候选生效，缺组件�
   assert.equal(value.servers[1].command, '/usr/bin/gopls');
   assert.deepEqual(value.servers[1].env, { X: '1' }, '覆盖同 id 建议字段但保留未知现有字段');
   assert.deepEqual(value.servers[2].initializationOptions, { tsserver: { path: '/a/node_modules/typescript/lib/tsserver.js' } }, '运行组件路径必须写进配置');
+  // 项目根不落盘：扫描到的根只是当前会话的事实（换机器即失效，还会缩小多仓查询范围）。
+  assert.deepEqual(value.servers[1].roots, ['/repo/go'], '配置里本来就有 roots 时原样保留');
+  assert.deepEqual(value.servers[2].roots, [], '扫描到的项目根不写进配置（写入空数组以清掉旧值）');
   assert.equal(value.servers[3].command, '/y/clangd');
   assert.equal(value.servers.some(server => server.id === 'pyright'), false, '未安装的服务器不写入');
   assert.equal(value.servers.some(server => server.id === 'rust-analyzer'), false, '缺运行组件时不得写入必然失败的配置');
@@ -216,7 +219,7 @@ test('列表卡片：服务器设置详情、验证状态与评估目录标注',
     { id: 'typescript-language-server', command: '/prefix/tls/bin/tls', args: ['--stdio'], languages: { typescript: ['.ts'], javascript: ['.js'] } },
   ] });
   // openServers 注入为展开第一项。
-  const tree = await renderSettings({ states: [configJson, false, [], '', null, {}, { 0: true }, '', false, ''], configJson });
+  const tree = await renderSettings({ states: [configJson, false, [], '', null, {}, { 0: true, 1: true }, '', false, ''], configJson });
   const labels = tree.elements.filter(node => node.type === 'button').map(buttonLabel);
   assert.ok(labels.includes('＋ 新增配置'));
   assert.ok(tree.text.includes('服务器（2）'));
@@ -226,7 +229,9 @@ test('列表卡片：服务器设置详情、验证状态与评估目录标注',
   assert.ok(tree.text.includes('程序路径'), '展开后显示程序路径');
   assert.ok(tree.text.includes('/Users/voidmind/go/bin/gopls'));
   assert.ok(tree.text.includes('语言：go'));
-  assert.ok(tree.text.includes('项目根目录：/Users/voidmind/Documents/GolandProjects/uos'));
+  assert.ok(tree.text.includes('项目根目录（固定评估）：/Users/voidmind/Documents/GolandProjects/uos'));
+  // 没有配置根目录的服务器必须如实说明“随工作区自动判定”，而不是留空让人以为没生效。
+  assert.ok(tree.text.includes('项目根目录：未固定，随当前会话工作区与最近的项目标记自动判定'));
   assert.ok(labels.includes('编辑配置 JSON'), '从详情可直接进入 JSON 编辑');
 
   const statusConfigJson = JSON.stringify({ servers: [
@@ -249,19 +254,29 @@ test('列表卡片：服务器设置详情、验证状态与评估目录标注',
   assert.ok(statusTree.text.includes('尚未验证：本次未启动该服务器'));
   assert.ok(statusTree.text.includes('/ws'));
 
-  const targetConfigJson = JSON.stringify({ servers: [{
-    id: 'gopls', command: '/Users/voidmind/go/bin/gopls', args: [], languages: { go: ['.go'] },
-    roots: ['/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web'],
-  }] });
+  const targetConfigJson = JSON.stringify({ servers: [
+    {
+      id: 'gopls', command: '/Users/voidmind/go/bin/gopls', args: [], languages: { go: ['.go'] },
+      roots: ['/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web'],
+    },
+    { id: 'typescript-language-server', command: '/bin/tls', args: ['--stdio'], languages: { typescript: ['.ts'] } },
+  ] });
   const targetSessions = [{ id: 's-current', cwd: '/Users/voidmind/Documents/DSHplugins' }];
   const targetReport = {
     complete: true, projects: [],
-    servers: [{ serverId: 'gopls', language: 'go', status: 'ready', command: '/Users/voidmind/go/bin/gopls', candidates: [], roots: ['/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web'], dependencies: [], target: '/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web', targetSource: 'config' }],
+    servers: [
+      { serverId: 'gopls', language: 'go', status: 'ready', command: '/Users/voidmind/go/bin/gopls', candidates: [], roots: ['/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web'], dependencies: [], target: '/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web', targetSource: 'config' },
+      // 没有配置根目录的服务器：评估目录来自会话工作区，界面要标成自动判定。
+      { serverId: 'typescript-language-server', language: 'tsjs', status: 'ready', command: '/bin/tls', candidates: [], roots: [], dependencies: [], target: '/Users/voidmind/Documents/DSHplugins', targetSource: 'session' },
+    ],
+    sandboxWarning: '受限会话的沙箱只允许写会话工作区与临时目录，但缓存目标在可写范围之外：GOCACHE=/Users/voidmind/Library/Caches/go-build（来自环境变量）。',
   };
   // states：draft、dirty、sessions、sessionId、report、choices、openServers、error、busy、notice、view、verification
   const targetVerification = { gopls: { ok: true, root: '/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web', capabilities: ['definitionProvider'] } };
-  const targetTree = await renderSettings({ states: [targetConfigJson, false, targetSessions, 's-current', targetReport, {}, { 0: true }, '', false, '', 'list', targetVerification], configJson: targetConfigJson });
+  const targetTree = await renderSettings({ states: [targetConfigJson, false, targetSessions, 's-current', targetReport, {}, { 0: true, 1: true }, '', false, '', 'list', targetVerification], configJson: targetConfigJson });
   assert.ok(targetTree.text.includes('评估目录：/Users/voidmind/Documents/GolandProjects/G_Ocean/G-Ocean-web（来自配置的项目根目录）'), '标注真实评估目标');
+  assert.ok(targetTree.text.includes('评估目录：/Users/voidmind/Documents/DSHplugins（随工作区与项目标记自动判定）'), '没有配置根目录时如实标注自动判定');
+  assert.ok(targetTree.text.includes('沙箱缓存提示：'), '缓存目标不可写时在页面上给出原因');
   assert.ok(targetTree.text.includes('验证通过'), '其它项目的服务器也能验证');
   assert.ok(targetTree.text.includes('1 项能力'));
   const targetLabels = targetTree.elements.filter(node => node.type === 'button').map(buttonLabel);

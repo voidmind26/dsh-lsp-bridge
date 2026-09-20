@@ -466,9 +466,11 @@ export function apply(ctx, input = {}) {
         try {
           // 只读诊断在任何权限下都可以做；验证会启动进程，因此受限会话必须经由会话沙箱约束。
           const diagnosis = await diagnoseWorkspace({ workspace: session.header.cwd, languages: parsed.body.languages, install: config.install, configured: config.servers, signal: request.signal });
+          // 受限会话的缓存目标若不可写，界面与模型需要在启动服务器之前就看到原因。
+          const sandboxWarning = pool.cacheWarning(session);
           // 诊断先入缓存：即使验证被拒，界面与模型上下文也能拿到真实状态，而不是“未扫描到”。
           diagnosisCache.set(session.header.cwd, diagnosis);
-          if (parsed.body.verify !== true) return jsonResponse(diagnosis);
+          if (parsed.body.verify !== true) return jsonResponse({ ...diagnosis, ...(sandboxWarning ? { sandboxWarning } : {}) });
           let execution = null;
           try {
             execution = pool.executionFor(session);
@@ -477,6 +479,7 @@ export function apply(ctx, input = {}) {
             return jsonResponse({
               ...diagnosis,
               verification: [],
+              ...(sandboxWarning ? { sandboxWarning } : {}),
               verificationRefused: {
                 code: 'sandbox-unavailable',
                 detail: error.code ?? null,
@@ -485,7 +488,7 @@ export function apply(ctx, input = {}) {
             });
           }
           const verification = await verifyDiagnosis(diagnosis, { workspace: session.header.cwd, signal: request.signal, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution.confine, env: execution.env });
-          const result = { ...diagnosis, verification };
+          const result = { ...diagnosis, verification, ...(sandboxWarning ? { sandboxWarning } : {}) };
           diagnosisCache.set(session.header.cwd, result);
           return jsonResponse(result);
         } catch (error) {
@@ -501,7 +504,7 @@ export function apply(ctx, input = {}) {
 
   ctx.tools.register({
     name: 'lsp',
-    description: `查询与修改可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号、诊断，以及 rename/format 这类会写磁盘的操作。rename/format 只在 apply=true 时写入，否则只返回将要改动的内容；写入受会话权限约束（只读会话直接拒绝，workspace-write 只允许工作区内的文件），被拒绝时会说明需要完全访问权限（danger-full-access）。插件会把当前工作区已配置的语言服务自动注入上下文，通常不必先探路。workspaceSymbols 无文件可推断语言时，会先按“是否覆盖当前工作区”自动选择服务器，只有多个都覆盖时才要求显式传 server；冷启动时会先做一次有界预热打开项目文件，避免 TypeScript 报 No Project. 或返回空结果。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。不暴露编辑或命令。服务是可信的本地程序：danger-full-access 会话直接启动；受限会话（workspace-write/read-only）会先由 DSH 沙箱包装服务器进程，使其只能写会话工作区与临时目录；部署没有可用沙箱后端时失败关闭，绝不无沙箱启动，也不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查。`,
+    description: `查询与修改可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号、诊断，以及 rename/format 这类会写磁盘的操作。rename/format 只在 apply=true 时写入，否则只返回将要改动的内容；写入受会话权限约束（只读会话直接拒绝，workspace-write 只允许工作区内的文件），被拒绝时会说明需要完全访问权限（danger-full-access）。插件会把当前工作区已配置的语言服务自动注入上下文，通常不必先探路。workspaceSymbols 无文件可推断语言时，会先按“是否覆盖当前工作区”自动选择服务器，只有多个都覆盖时才要求显式传 server；冷启动时会先在服务器自己的项目根内做一次有界预热打开项目文件，避免 TypeScript 报 No Project. 或返回空结果（配置在别的工程下的服务器同样会预热；调用方传入的 file 仍以会话工作区为边界）。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。不暴露编辑或命令。服务是可信的本地程序：danger-full-access 会话直接启动；受限会话（workspace-write/read-only）会先由 DSH 沙箱包装服务器进程，使其只能写会话工作区与临时目录；部署没有可用沙箱后端时失败关闭，绝不无沙箱启动，也不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查。`,
     parameters,
     output: {
       schema: { type: 'object', additionalProperties: false, required: ['json', 'truncated'], properties: { json: { type: 'string' }, truncated: { type: 'boolean' } } },
@@ -532,7 +535,7 @@ export function apply(ctx, input = {}) {
 
   ctx.tools.register({
     name: 'lsp_setup',
-    description: `自动准备语言服务器，无需人工扫描或手写配置：诊断工作区项目所需的 LSP 服务器及其运行组件（例如 TypeScript 的 tsserver），按固定允许列表安装缺失组件，把可用服务器写入插件配置，并真实启动一次完成 initialize 验证。你只能提供本目录中的服务器 ID（gopls、rust-analyzer、typescript-language-server、pyright、clangd）；不能提供命令、参数、包名或安装路径。安装命令来自冻结的 catalog（go/npm/rustup/cargo/venv/brew），不经 shell、不使用 sudo；只有 operation=install/auto 且显式 apply=true 才执行安装，status 与 verify 从不安装。安装目录默认 $DSH_HOME/lsp-bridge，可由 config.install 调整，install.enabled=false 可整体禁用。status/configure/verify 在受限会话同样可用（验证会由会话沙箱约束服务器进程）；只有真正执行安装命令的步骤要求 danger-full-access，因为安装器在插件内直接执行、不经过会话沙箱。绝不自动提权。典型用法：先 status 查看缺什么，再 auto + apply=true 一次完成安装、配置与验证。`,
+    description: `自动准备语言服务器，无需人工扫描或手写配置：诊断工作区项目所需的 LSP 服务器及其运行组件（例如 TypeScript 的 tsserver），按固定允许列表安装缺失组件，把可用服务器写入插件配置（不写扫描到的项目根：默认让服务器随会话工作区与项目标记自动判定，只有配置里本来就有的 roots 才回写），并真实启动一次完成 initialize 验证。你只能提供本目录中的服务器 ID（gopls、rust-analyzer、typescript-language-server、pyright、clangd）；不能提供命令、参数、包名或安装路径。安装命令来自冻结的 catalog（go/npm/rustup/cargo/venv/brew），不经 shell、不使用 sudo；只有 operation=install/auto 且显式 apply=true 才执行安装，status 与 verify 从不安装。安装目录默认 $DSH_HOME/lsp-bridge，可由 config.install 调整，install.enabled=false 可整体禁用。status/configure/verify 在受限会话同样可用（验证会由会话沙箱约束服务器进程）；只有真正执行安装命令的步骤要求 danger-full-access，因为安装器在插件内直接执行、不经过会话沙箱。绝不自动提权。典型用法：先 status 查看缺什么，再 auto + apply=true 一次完成安装、配置与验证。`,
     parameters: setupParameters,
     output: {
       schema: { type: 'object', additionalProperties: false, required: ['json', 'truncated'], properties: { json: { type: 'string' }, truncated: { type: 'boolean' } } },
@@ -563,7 +566,9 @@ export function apply(ctx, input = {}) {
         spawnRefused = error.message;
       }
       const result = await runSetup({ operation: args.operation, args, workspace: session.header.cwd, config, scope: settingsScope, cache: diagnosisCache, execution, spawnRefused, signal: exec.signal });
-      return boundedResult(result, config.maxOutputChars);
+      // 受限会话的缓存目标不可写时，把原因放进下一步建议，而不是等服务器启动失败。
+      const sandboxWarning = pool.cacheWarning(session);
+      return boundedResult(sandboxWarning ? { ...result, nextActions: [...(result.nextActions ?? []), sandboxWarning] } : result, config.maxOutputChars);
     },
     presentCall: args => ({
       card: 'generic',

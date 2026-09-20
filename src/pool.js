@@ -1,5 +1,5 @@
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { LspManager } from './engine.js';
 
 // 部署默认权限没有独立变更事件；此间隔也为未发布事件的宿主提供兜底。
@@ -8,6 +8,10 @@ export const POLICY_POLL_INTERVAL_MS = 1000;
 /** 受限会话中把服务器的缓存目录重定向到可写位置（沙箱只允许写工作区与临时目录）。 */
 export const CACHE_DIRECTORY_NAME = 'dsh-lsp-bridge';
 const REDIRECTED_CACHE_KEYS = Object.freeze(['GOCACHE', 'GOTMPDIR', 'XDG_CACHE_HOME']);
+const insideDirectory = (base, target) => {
+  const rel = relative(base, target);
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+};
 
 /** 校验 sandbox 配置：仅在受限会话中使用，danger-full-access 不受影响。 */
 export function normalizeSandboxConfig(input = {}, { env = process.env } = {}) {
@@ -30,6 +34,45 @@ export function sandboxEnvironment(config, { env = process.env } = {}) {
     if (env[key] === undefined) additions[key] = config.cacheDirectory;
   }
   return Object.keys(additions).length ? additions : null;
+}
+
+/** 会话沙箱的可写范围（与部署用于这些会话的 seatbelt profile 一致）：会话工作区 + 临时目录。 */
+export function sandboxWritableRoots(policy, { tmpdir: directory = tmpdir() } = {}) {
+  return [...new Set([policy?.workspaceRoot, '/tmp', directory].filter(value => typeof value === 'string' && value))];
+}
+
+/**
+ * 受限会话里服务器实际会拿到的缓存目录中，落在沙箱可写范围之外的项。
+ * 覆盖两种情况：插件重定向填入的目录（sandbox.cacheDirectory），以及环境里已存在、
+ * 插件按“管理员显式设置优先”不会覆盖的缓存变量——两种都不该等到服务器启动失败才发现。
+ */
+export function unwritableCacheTargets(config, policy, { env = process.env, tmpdir: directory } = {}) {
+  const additions = sandboxEnvironment(config, { env }) ?? {};
+  const writable = sandboxWritableRoots(policy, { tmpdir: directory });
+  const outside = [];
+  for (const key of REDIRECTED_CACHE_KEYS) {
+    const target = additions[key] ?? env[key];
+    if (typeof target !== 'string' || !isAbsolute(target)) continue;
+    if (!writable.some(root => insideDirectory(root, target))) outside.push({ key, target, source: additions[key] === undefined ? 'environment' : 'config' });
+  }
+  return outside;
+}
+
+/** 结构化提示：受限会话里缓存目标不可写时尽早说明，而不是让服务器以“写被拒”失败。 */
+export function sandboxCacheWarning(config, policy, options = {}) {
+  if (!config?.redirectCaches) return null;
+  const outside = unwritableCacheTargets(config, policy, options);
+  if (!outside.length) return null;
+  // 多个缓存变量常常指向同一个目录：按目标合并，消息里不重复同一路径。
+  const grouped = new Map();
+  for (const item of outside) {
+    const group = grouped.get(item.target) ?? { keys: [], sources: new Set() };
+    group.keys.push(item.key);
+    group.sources.add(item.source);
+    grouped.set(item.target, group);
+  }
+  const list = [...grouped].map(([target, group]) => `${group.keys.join('/')}=${target}（来自${[...group.sources].map(source => source === 'config' ? 'sandbox.cacheDirectory' : '环境变量').join('、')}）`).join('；');
+  return `受限会话的沙箱只允许写会话工作区与临时目录，但缓存目标在可写范围之外：${list}。语言服务器可能因此启动失败；可把 sandbox.cacheDirectory 指到工作区或临时目录，或清除对应的环境变量。`;
 }
 
 /** 按会话对象身份和 cwd 隔离；同一持久 ID 的重新加载对象不得继承旧权限或进程。 */
@@ -94,6 +137,18 @@ export class LspSessionPool {
   /** 兼容旧调用点：只做权限判定，不返回执行计划。 */
   checkPermission(session) {
     this.executionFor(session);
+  }
+
+  /**
+   * 受限会话里缓存目标不可写时的结构化提示；完全访问会话返回 null（不使用沙箱缓存重定向）。
+   * 只报告不改变行为：管理员显式设置的缓存变量仍然优先。
+   */
+  cacheWarning(session) {
+    let policy;
+    try { policy = this.resolvePolicy(session); }
+    catch { return null; }
+    if (policy?.mode === 'danger-full-access') return null;
+    return sandboxCacheWarning(this.sandboxConfig, policy);
   }
 
   // 先标记不可租用，再取消；关闭中的条目仍占配额，直到 dispose 真正完成。

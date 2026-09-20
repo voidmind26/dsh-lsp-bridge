@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { CATALOG } from './catalog.js';
-import { discoverWorkspace } from './discovery.js';
+import { WORKSPACE_BIN_DIRECTORIES, discoverWorkspace } from './discovery.js';
 import { probeLanguageServer } from './engine.js';
 
 export const INSTALL_TIMEOUT_MS = 300000;
@@ -298,7 +298,28 @@ async function configuredEntries(workspace, configured, { env, platform, install
     const appliesHere = resolvedRoots.length > 0 || await hasWorkspaceMarker(canonical, markers);
     if (!appliesHere) continue;
     const target = resolvedRoots[0] ?? canonical;
-    const command = resolveConfiguredCommand(definition.command, { env, platform });
+    // 命令来源与工作区无关，按“越贴近这台服务器越好”的顺序解析：
+    // 配置里的绝对路径 → PATH → 目标工程自己的 bin 目录（node_modules/.bin 等）→ 插件安装前缀。
+    // 这三种位置的目录都可能落在会话工作区之外，因此处理必须一致。
+    let command = resolveConfiguredCommand(definition.command, { env, platform });
+    let commandSource = command ? 'config' : null;
+    if (!command && typeof definition.command === 'string' && !isAbsolute(definition.command)) {
+      const name = basename(definition.command);
+      for (const root of resolvedRoots) {
+        for (const directory of WORKSPACE_BIN_DIRECTORIES) {
+          const found = executableFileSync(join(root, directory, name));
+          if (found) { command = found; commandSource = 'project'; break; }
+        }
+        if (command) break;
+      }
+    }
+    if (!command) {
+      const managed = managedBinaryPath(server, installConfig);
+      if (managed && executableFileSync(managed)) {
+        command = managed;
+        commandSource = 'plugin';
+      }
+    }
     // 运行组件按服务器自己的项目目录查找（例如该项目自己的 node_modules）。
     const dependencies = server ? await diagnoseDependencies(server, { workspace: target, command, installConfig }) : [];
     const initializationOptions = server ? initializationOptionsFor(server, dependencies) : undefined;
@@ -317,7 +338,7 @@ async function configuredEntries(workspace, configured, { env, platform, install
       candidates: [],
       status: missingDependency ? 'missing-dependency' : command ? 'ready' : 'missing-command',
       command,
-      commandSource: command ? 'config' : null,
+      commandSource,
       dependencies,
       install: server ? buildInstallPlan(server, { env, platform, installConfig }) : { available: false, reason: 'no-portable-installer' },
       ...(initializationOptions === undefined ? {} : { initializationOptions }),
@@ -344,7 +365,7 @@ export async function diagnoseWorkspace({ workspace, env = process.env, platform
   const installConfig = normalizeInstallConfig(install, { env });
   const report = await discoverWorkspace({ workspace, env, platform, languages, signal });
   const canonicalWorkspace = await realpath(workspace);
-  const servers = [];
+  const discovered = [];
   for (const plan of report.plans) {
     const entry = SERVER_INDEX.get(plan.serverId);
     const server = entry?.server;
@@ -361,7 +382,7 @@ export async function diagnoseWorkspace({ workspace, env = process.env, platform
     const initializationOptions = server ? initializationOptionsFor(server, dependencies) : undefined;
     const missingDependency = dependencies.some(dependency => !dependency.satisfied);
     const status = missingDependency ? 'missing-dependency' : command ? 'ready' : plan.status === 'needs-choice' ? 'needs-choice' : 'missing-command';
-    servers.push({
+    discovered.push({
       ...plan,
       status,
       command,
@@ -374,9 +395,25 @@ export async function diagnoseWorkspace({ workspace, env = process.env, platform
       ...(initializationOptions === undefined ? {} : { initializationOptions }),
     });
   }
-  // 配置在别的项目下的服务器不在这里补状态：界面会说明扫描边界。
-  const covered = new Set(servers.map(server => server.serverId));
-  for (const entry of await configuredEntries(workspace, (configured ?? []).filter(item => !covered.has(item?.id)), { env, platform, installConfig })) {
+  // 同一 id 既被发现又被配置时，以配置条目为准：查询实际用的是配置声明的 roots/workspaceFolders
+  // （engine.rootFor 优先用配置根），如果让发现条目覆盖它，界面与验证就会对着会话工作区评估
+  // 一台实际运行在别的工程下的服务器。配置在别的项目下、工作区里没有被发现的服务器照常补条目。
+  const configuredServers = await configuredEntries(workspace, configured, { env, platform, installConfig });
+  const configuredIds = new Set(configuredServers.map(entry => entry.serverId));
+  const discoveredById = new Map(discovered.map(entry => [entry.serverId, entry]));
+  const servers = discovered.filter(entry => !configuredIds.has(entry.serverId));
+  for (const entry of configuredServers) {
+    // 发现路径可能找到了配置里没写全的命令（PATH、工作区的 node_modules/.bin、插件安装前缀）：
+    // 只把它当作命令兜底，评估目标仍由配置决定。
+    const found = discoveredById.get(entry.serverId);
+    if (!entry.command && found?.command) {
+      entry.command = found.command;
+      entry.commandSource = found.commandSource ?? null;
+      if (!entry.dependencies.some(dependency => !dependency.satisfied)) entry.status = 'ready';
+    } else if (!entry.command && found?.status === 'needs-choice' && (found.candidates ?? []).length) {
+      entry.candidates = found.candidates;
+      entry.status = 'needs-choice';
+    }
     servers.push(entry);
   }
   const actionable = servers.filter(server => server.status === 'missing-command' || server.status === 'missing-dependency');
@@ -416,6 +453,11 @@ export function mergeServersIntoConfig(currentText, servers) {
 /**
  * 从诊断结果生成可写入配置的服务器定义。
  * 缺少运行组件的条目只有在依赖被满足后才允许写入，避免保存一个必然启动失败的配置。
+ *
+ * **项目根不落盘**：只有在配置里本来就显式声明了 roots（`targetSource === 'config'`）时才回写它们；
+ * 扫描得到的项目根只是"当前会话里的事实"，写进配置会把某次扫描结果固化成绝对路径：
+ * 换机器/换 checkout 目录即失效，多仓工作区里还会把无 file 的工作区符号查询缩小到一个仓。
+ * 写 `roots: []` 是刻意的——merge 是字段级合并，省略该字段会保留旧的 roots，用户就再也摘不掉。
  */
 export function configServersFromDiagnosis(diagnosis, { servers, choices = {} } = {}) {
   const wanted = servers === undefined ? null : new Set(servers);
@@ -433,7 +475,7 @@ export function configServersFromDiagnosis(diagnosis, { servers, choices = {} } 
       args: entry.args,
       languages: entry.languages,
       rootMarkers: entry.rootMarkers,
-      roots: entry.roots,
+      roots: entry.targetSource === 'config' ? [...(entry.roots ?? [])] : [],
       ...(entry.initializationOptions === undefined ? {} : { initializationOptions: entry.initializationOptions }),
     });
   }
