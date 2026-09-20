@@ -1,6 +1,6 @@
 # dsh-lsp-bridge
 
-Bridge DeepSeek Harness to language servers for read-only code intelligence, with multi-language configuration, multi-root workspace support, and session-scoped server reuse.
+Bridge DeepSeek Harness to language servers for code intelligence — read-only queries plus permission-gated rewrites — with model-driven installation and configuration, multi-language discovery, multi-root workspaces, and session-scoped server reuse.
 
 为 DeepSeek Harness 的 LLM 提供通用 LSP 查询工具 `lsp`。支持按语言配置多个 stdio 语言服务器、独立项目根目录和显式多根工作区，并在 Web 与 Desktop 的插件设置中提供自动发现和配置界面。Node.js ≥22，无安装期构建。
 
@@ -117,7 +117,7 @@ dsh_packaged plugin --profile desktop add github:voidmind26/dsh-lsp-bridge
 
 UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现有扫描深度、目录/项目数和时间限制；若结果被截断，界面会明确提示，不能把它当成完整枚举。内置 catalog 以外的语言仍可手工配置。
 
-**扫描与安装是两件事：** 扫描只读、永不安装；安装只发生在智能体显式执行 `lsp_setup` 的 `install`/`auto`（且 `apply=true`）时，命令限于 catalog 允许列表，界面上会展示将要执行的确切命令。缺失且无可移植方案时只给出人工安装建议（例如 clangd）。当前发现接口与语言服务器启动一样要求目标会话为 `danger-full-access`，不会自动提权。
+**扫描与安装是两件事：** 扫描只读、永不安装；安装只发生在智能体显式执行 `lsp_setup` 的 `install`/`auto`（且 `apply=true`）时，命令限于 catalog 允许列表，界面上会展示将要执行的确切命令。缺失且无可移植方案时只给出人工安装建议（例如 clangd）。发现接口只读，任何权限的会话都可以调用；不会自动提权。
 
 ## 通用配置
 
@@ -140,6 +140,8 @@ UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现�
 | `maxSessions` | 常驻会话引擎数量上限，默认 4 |
 | `maxFileBytes` | 文件读取上限，插件默认 1 MiB，最高 8 MiB |
 | `maxOutputChars` | 工具 JSON 输出字符上限，默认 30000，最小 256 |
+| `sandbox.redirectCaches` | 受限会话中是否把服务器缓存变量重定向到可写临时目录，默认 true |
+| `sandbox.cacheDirectory` | 缓存重定向目标，默认 `os.tmpdir()/dsh-lsp-bridge`，必须为绝对路径 |
 
 ### 多目录语义
 
@@ -160,10 +162,24 @@ UI 与 Web/Desktop 共用同一 `platform: web` 客户端 Bundle。自动发现�
 
 ## 安全与生命周期
 
-**只暴露只读 LSP 操作，不意味着语言服务器进程被沙箱隔离。** 语言服务器本质上是本地可执行程序，可能读取依赖、写缓存、加载插件或运行工具链。仅配置你信任的程序和项目。
+**语言服务器本质上是本地可执行程序**，可能读取依赖、写缓存、加载插件或运行工具链。仅配置你信任的程序和项目。
 
-- 当前适配层每次调用检查会话有效 sandbox policy，仅允许 `danger-full-access`；受限会话直接拒绝，不自动提权或修改设置。
-- 模型无法通过工具指定 command/env，不能发送任意 LSP method 或执行 WorkspaceEdit。
+写入能力（`rename`、`format`，以及服务器主动发起的 `workspace/applyEdit`）默认是**先预览后写入**：不带 `apply: true` 只返回将要改动的内容，`apply: true` 才落盘。写入始终限制在会话工作区内，并按会话权限判定：
+
+| 会话权限 | 写入行为 |
+| --- | --- |
+| `danger-full-access` | 允许（仍限定在工作区内），服务器进程不被沙箱包装 |
+| `workspace-write` | 允许工作区内的文件；服务器进程同时被会话沙箱约束 |
+| `read-only` | 拒绝，并明确提示**需要完全访问权限（danger-full-access）** |
+
+被沙箱或权限挡住时不会静默失败：只读会话、工作区外目标、非文本编辑（创建/重命名/删除文件）都会给出具体原因。
+
+- **权限模型**：语言服务器进程按会话权限处理，且不会因为插件而放宽。
+  - `danger-full-access`：按用户授权直接启动（服务器是未被 OS 沙箱隔离的可信程序）。
+  - `workspace-write` / `read-only`：服务器 argv 先交给 DSH 沙箱服务（`ctx.sandbox.confine`，macOS 为 seatbelt）包装，因此它只能写会话工作区、`/tmp` 与用户临时目录；插件会把 `GOCACHE`、`GOTMPDIR`、`XDG_CACHE_HOME` 重定向到临时目录（可用 `sandbox.redirectCaches=false` 关闭，或 `sandbox.cacheDirectory` 指定绝对路径）。
+  - 部署没有可用沙箱后端时**失败关闭**：绝不退化成无沙箱启动，也不自动提权。`read-only` 会话下沙箱不允许任何写入，部分服务器可能因此启动失败，错误会说明原因。
+  - 扫描（只读诊断）在任何权限下都可用；`lsp_setup` 的 `status`/`configure`/`verify` 在受限会话可用，只有真正执行安装命令的步骤要求 `danger-full-access`（安装器在插件内直接执行、不经过会话沙箱）。
+- 模型无法通过工具指定 command/env，也不能发送任意 LSP method；写入只能通过 `rename`/`format` 或服务器发起的 `applyEdit`，并受上面的权限与工作区边界约束。
 - 文件与根目录经 realpath 工作区检查，拒绝路径穿越与符号链接逃逸。但这不限制服务器自行读取依赖，也不是对抗并发文件替换攻击的 OS 沙箱。
 - **按会话与工作目录常驻复用引擎**，同一语言、项目根目录的后续调用复用语言服务器，避免重复初始化；不同会话隔离。`status.instances` 可查看当前会话已启动的实例。
 - 空闲超过 `idleTimeoutMs`（默认 5 分钟）回收会话引擎；活动请求不因空闲超时被回收。`maxSessions`（默认 4）限制会话池容量，`maxInstances` 限制每个引擎的服务器实例数。

@@ -8,6 +8,11 @@ test('配置校验、Standard Schema 契约与 settings 热替换', async () => 
   assert.throws(() => validateConfig({ servers: [{ id: 'a', command: 'a', languages: {} }] }));
   assert.throws(() => validateArgs({ operation: 'hover', file: 'x.go', line: 0, character: 1 }));
   assert.equal(validateArgs({ operation: 'hover', file: 'x.go', line: 1, character: 1 }).line, 1);
+  // 写入操作的参数约束：rename 需要 newName，apply/tabSize 类型受限。
+  assert.equal(validateArgs({ operation: 'rename', file: 'x.js', line: 1, character: 1, newName: 'y', apply: true }).newName, 'y');
+  assert.throws(() => validateArgs({ operation: 'rename', file: 'x.js', line: 1, character: 1 }), /rename requires newName/);
+  assert.throws(() => validateArgs({ operation: 'format', file: 'x.js', apply: 'yes' }), /apply must be a boolean/);
+  assert.throws(() => validateArgs({ operation: 'format', file: 'x.js', tabSize: 99 }), /tabSize/);
 
   let tool, settingsRegistration, watcher;
   const cleanups = [];
@@ -36,7 +41,8 @@ test('配置校验、Standard Schema 契约与 settings 热替换', async () => 
   await Promise.all(cleanups.filter(value => typeof value === 'function').map(value => value()));
 });
 
-test('工具注册：受限会话拒绝执行、全权限输出有界', async () => {
+test('工具注册：受限会话按沙箱可用性放行或失败关闭、全权限输出有界', async () => {
+  // 没有沙箱后端：受限会话失败关闭，绝不退化成无沙箱启动。
   let tool, cleanup;
   const ctx = {
     tools: { register: value => { if (value.name === 'lsp') tool = value; } },
@@ -46,8 +52,23 @@ test('工具注册：受限会话拒绝执行、全权限输出有界', async ()
   apply(ctx, {});
   assert.equal(tool.name, 'lsp');
   assert.deepEqual(tool.parameters.required, ['operation']);
-  await assert.rejects(tool.execute({ operation: 'status' }, { agent: { session: { header: { cwd: process.cwd() } } } }), /denied|restricted/i);
+  await assert.rejects(tool.execute({ operation: 'status' }, { agent: { session: { header: { cwd: process.cwd() } } } }), /sandbox backend/);
   await cleanup();
+
+  // 提供沙箱服务后，受限会话可以执行只读操作（进程启动由 confine 包装）。
+  let confinedTool, confinedCleanup;
+  const confinedCtx = {
+    tools: { register: value => { if (value.name === 'lsp') confinedTool = value; } },
+    sandboxPolicy: { resolve: () => ({ mode: 'workspace-write' }) },
+    effect: factory => { confinedCleanup = factory(); },
+    inject: (services, callback) => {
+      if (services.includes('sandbox')) callback({ sandbox: { confine: argv => argv } });
+    },
+  };
+  apply(confinedCtx, { servers: [{ id: 'sample', command: 'not-started', languages: { example: ['.example'] } }] });
+  const confined = await confinedTool.execute({ operation: 'status' }, { agent: { session: { header: { cwd: process.cwd() } } } });
+  assert.equal(JSON.parse(confined.json).servers[0].id, 'sample');
+  await confinedCleanup();
 
   let fullTool, fullCleanup;
   const fullCtx = {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, symlink, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -60,6 +60,67 @@ test('工作区符号按覆盖范围自动选择服务器，只有都覆盖时�
   await assert.rejects(both.execute({ operation: 'workspaceSymbols', query: 'Example' }, { workspace }), /Multiple language servers match; specify server: inside, inside-two/);
   const explicit = await both.execute({ operation: 'workspaceSymbols', query: 'Example', server: 'inside-two' }, { workspace });
   assert.equal(explicit[0].name, 'Example', '显式指定时始终按指定服务器查询');
+});
+
+test('写入操作：dry-run 不改盘，apply 真正落盘，只读与工作区外按权限拒绝', async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-write-')));
+  await writeFile(join(workspace, 'main.mock'), 'original name\n');
+  await writeFile(join(workspace, 'other.mock'), 'other file\n');
+  const outside = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-outside-')));
+  await writeFile(join(outside, 'other.mock'), 'outside name\n');
+  const server = { id: 'mock', command: process.execPath, args: [mock], languages: { mock: ['.mock'] }, rootMarkers: [] };
+  const deny = new LspManager({ timeoutMs: 1000, servers: [server], writeMode: 'deny' });
+  const scoped = new LspManager({ timeoutMs: 1000, servers: [server], writeMode: 'workspace' });
+  const full = new LspManager({ timeoutMs: 1000, servers: [server], writeMode: 'full' });
+  t.after(async () => { await Promise.all([deny.dispose(), scoped.dispose(), full.dispose()]); await rm(workspace, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); });
+
+  // 只读会话：写入操作直接拒绝，并说明需要完全访问权限。
+  await assert.rejects(deny.execute({ operation: 'rename', file: 'main.mock', line: 1, character: 1, newName: 'renamed', apply: true }, { workspace }), /只读权限/);
+
+  // dry-run 只给计划，不动磁盘。
+  const planned = await scoped.execute({ operation: 'rename', file: 'main.mock', line: 1, character: 1, newName: 'renamed' }, { workspace });
+  assert.equal(planned.applied, false);
+  assert.equal(planned.dryRun, true);
+  assert.equal(planned.files[0].changed, true);
+  assert.equal(await readFile(join(workspace, 'main.mock'), 'utf8'), 'original name\n');
+
+  // apply 真正写入。
+  const applied = await scoped.execute({ operation: 'rename', file: 'main.mock', line: 1, character: 1, newName: 'renamed', apply: true }, { workspace });
+  assert.equal(applied.applied, true);
+  assert.equal(await readFile(join(workspace, 'main.mock'), 'utf8'), 'renamed name\n');
+  // rename 前必须预热项目，否则服务器看不到引用目标符号的其它文件，跨文件改名会改坏代码。
+  const afterRename = await scoped.execute({ operation: 'status' }, { workspace });
+  assert.ok(afterRename.instances[0].documents >= 2, 'rename 会预热项目内的其它文件');
+
+  // 工作区外的目标：无论权限如何都不越界，并说明工作区边界。
+  await assert.rejects(full.applyEdit({
+    workspace,
+    dryRun: false,
+    edit: { changes: { [pathToFileURL(join(outside, 'other.mock')).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } }, newText: 'changed' }] } },
+  }), /不在会话工作区内/);
+  assert.equal(await readFile(join(outside, 'other.mock'), 'utf8'), 'outside name\n');
+
+  // 服务器主动请求应用编辑：只读会话回传原因而不是静默失败。
+  const refused = await deny.applyServerEdit({ changes: { [pathToFileURL(join(workspace, 'main.mock')).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, newText: 'X' }] } }, workspace);
+  assert.equal(refused.applied, false);
+  assert.match(refused.failureReason, /完全访问权限/);
+});
+
+test('受限会话下 confine 包装真实 argv，并向服务器注入缓存环境', async t => {
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'dsh-lsp-confine-')));
+  await writeFile(join(workspace, 'main.mock'), 'hello');
+  const confined = [];
+  const manager = new LspManager({
+    timeoutMs: 1000,
+    servers: [{ id: 'mock', command: process.execPath, args: [mock], languages: { mock: ['.mock'] }, rootMarkers: [] }],
+    // 沙箱包装：记录收到的 argv 后原样返回（真实实现返回 sandbox-exec 前缀的 argv）。
+    confine: argv => { confined.push(argv); return argv; },
+    sandboxEnv: { GOCACHE: '/tmp/dsh-lsp-bridge' },
+  });
+  t.after(async () => { await manager.dispose(); await rm(workspace, { recursive: true, force: true }); });
+  const hover = await manager.execute({ operation: 'hover', file: 'main.mock', line: 1, character: 1 }, { workspace });
+  assert.equal(JSON.parse(hover.contents.value).text, 'hello');
+  assert.deepEqual(confined, [[process.execPath, mock]], 'confine 收到的是即将执行的完整 argv');
 });
 
 test('push-only diagnostics wait for asynchronous notification', async t => {

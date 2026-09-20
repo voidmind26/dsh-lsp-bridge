@@ -2,7 +2,7 @@
 
 ## 目标
 
-向 DSH 的 LLM 提供只读语义查询工具，而不是让模型通过 shell 手工拼接 LSP 协议。支持用户配置任意遵循 stdio LSP 的语言服务器，并处理多仓、多语言、多根目录项目。
+向 DSH 的 LLM 提供语义查询工具与受权限约束的写入能力，而不是让模型通过 shell 手工拼接 LSP 协议。支持用户配置任意遵循 stdio LSP 的语言服务器，并处理多仓、多语言、多根目录项目。
 
 ## 工作区与路由
 
@@ -15,8 +15,9 @@ uos 示例包含多个独立 Go module 与 Vue 工程；默认按 module 隔离�
 - JSON-RPC 2.0 + Content-Length 分帧，通过 stdio 通信，不使用 shell。
 - 懒启动、initialize/initialized、配置传递、按请求读取磁盘并同步文档。
 - 查询操作：状态、悬浮、定义、类型定义、实现、引用、文档符号、工作区符号、诊断。
+- 写入操作：`rename`（textDocument/rename）与 `format`（textDocument/formatting）；默认 dry-run，`apply=true` 才落盘。`rename` 前必须预热项目：实测在无 `tsconfig.json` 的推断项目里，只打开目标文件时 tsserver 只返回该文件自己的编辑，跨文件引用不会被改（代码会被改坏）；预热后同一目录的引用文件一并返回编辑（a.ts 与 b.ts 都被正确改名）。写入按会话权限判定（只读拒绝并提示需要完全访问权限，workspace-write 允许工作区内），且始终受 realpath 工作区边界约束；只支持文本编辑，文件级操作（CreateFile/RenameFile/DeleteFile）整批拒绝。`workspace/applyEdit` 仅在非只读会话向服务器声明，并复用同一套校验。
 - 输入行列号从 1 开始，列按 UTF-16 计数；原始 LSP 输出位置从 0 开始。
-- 不提供任意方法透传、重命名、代码动作执行或应用 WorkspaceEdit。
+- 不提供任意方法透传；写入仅限 `rename`、`format` 以及服务器主动发起的 `workspace/applyEdit`。
 - 请求超时、取消、异常退出时清理待处理请求；插件卸载时关闭进程。
 - DSH 适配器使用会话对象身份 + 工作目录作为常驻引擎边界；引擎内部按语言服务器、项目根目录和多根目录配置复用实例。不同会话不共享进程。
 - 配置 `idleTimeoutMs`（默认 300000）及 `maxSessions`（默认 4），空闲引擎自动回收；请求活动期间不做空闲回收。容量满时仅可回收空闲引擎，全部繁忙则拒绝额外会话。
@@ -66,7 +67,15 @@ Host 通过 `systemPrompt.context` 注入一个短片段，让模型不必先猜
 
 ## 安全边界
 
-配置中的语言服务器是用户信任的本地程序，具备执行代码和读取项目依赖的能力。“只读查询”不代表语言服务器进程本身被操作系统沙箱限制。首版若不能通过 DSH 接口可靠施加会话沙箱，则仅在当前会话允许 danger-full-access 时启动，不绕过受限会话权限。
+配置中的语言服务器是用户信任的本地程序，具备执行代码和读取项目依赖的能力。“只读查询”不代表语言服务器进程本身被操作系统沙箱限制。
+
+权限按会话执行、不由插件放宽：
+
+- `danger-full-access`：直接启动（用户已明确授权无沙箱执行）。
+- 其它模式：先调用 `ctx.sandbox.confine(argv, policy)` 包装 argv，使服务器进程接受与会话相同的文件约束（macOS seatbelt：可读全部、允许网络、只允许写工作区与临时目录）。缓存类环境变量（`GOCACHE`/`GOTMPDIR`/`XDG_CACHE_HOME`）重定向到临时目录，避免服务器因写缓存被拒而失败。
+- `confine` 抛 `SANDBOX_UNAVAILABLE` 或部署未加载沙箱服务时**失败关闭**，绝不无沙箱启动；`read-only` 模式没有任何可写根，部分服务器会因此失败，错误中给出提示。
+- 已用等价的 seatbelt profile（`writableRoots` = 工作区 + `/tmp` + canonical `os.tmpdir()`）实测：`typescript-language-server` 返回 413 个文档符号、`gopls` 返回 100 个工作区符号，均在沙箱内正常工作。tsserver 会在 `os.tmpdir()` 下建临时目录，因此该根必须可写（DSH 的 `writableRoots` 已包含它）。
+- 安装命令仍要求 `danger-full-access`：安装器在插件进程内直接执行，不经过会话沙箱，因此不能用受限会话的权限去装软件。
 
 `lsp_setup` 扩大了插件的权限：它可以按固定允许列表安装软件并写入插件配置。因此它要求同一 `danger-full-access` 门控、要求显式 `apply=true`、只接受 catalog 中的服务器 ID，且所有命令都出现在工具调用结果中供用户审阅。`install.enabled=false` 可以整体关闭安装能力。
 

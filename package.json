@@ -1,7 +1,7 @@
 {
   "name": "dsh-lsp-bridge",
   "version": "0.3.0",
-  "description": "Bridge DeepSeek Harness to language servers for read-only code intelligence, with model-driven installation and configuration, multi-language discovery, multi-root workspaces, and session-scoped server reuse.",
+  "description": "Bridge DeepSeek Harness to language servers for code intelligence — read-only queries plus permission-gated rewrites — with model-driven installation and configuration, multi-language discovery, multi-root workspaces, and session-scoped server reuse.",
   "author": "voidmind26 <voidmind26@gmail.com>",
   "repository": {
     "type": "git",
@@ -48,7 +48,7 @@
   "scripts": {
     "build:client": "node scripts/build-client.mjs",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/index.js && node --check src/catalog.js && node --check src/discovery.js && node --check src/setup.js && node --check src/context.js && node --check src/pool.js && node --check src/engine.js && node --check src/transport.js && node --check src/client.js && node --check lib/client.js"
+    "check": "node --check src/index.js && node --check src/catalog.js && node --check src/discovery.js && node --check src/setup.js && node --check src/context.js && node --check src/edits.js && node --check src/pool.js && node --check src/engine.js && node --check src/transport.js && node --check src/client.js && node --check lib/client.js"
   },
   "engines": {
     "node": ">=22"

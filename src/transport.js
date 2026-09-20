@@ -8,8 +8,10 @@ export function abortError() {
 
 /** Bounded, dependency-free Content-Length JSON-RPC over a child process. */
 export class LspTransport {
-  constructor({ command, args = [], env, cwd, timeoutMs = 15000, onRequest, onNotification }) {
+  constructor({ command, args = [], env, cwd, timeoutMs = 15000, confine, onRequest, onNotification }) {
     this.timeoutMs = timeoutMs;
+    this.command = command;
+    this.confined = typeof confine === 'function';
     this.onRequest = onRequest;
     this.onNotification = onNotification;
     this.pending = new Map();
@@ -21,14 +23,28 @@ export class LspTransport {
     this.stderr = '';
     this.failure = null;
     this.closing = false;
-    this.child = spawn(command, args, { cwd, env: { ...process.env, ...env }, shell: false, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    // 受限会话里 argv 由会话沙箱包装；拿不到沙箱时上层已经失败关闭，这里不再兜底放行。
+    let argv = [command, ...args];
+    if (typeof confine === 'function') {
+      try {
+        argv = confine(argv);
+      } catch (error) {
+        throw Object.assign(new Error(`无法在受限会话中安全启动语言服务器（沙箱不可用）：${error.message}`), { code: error.code });
+      }
+      if (!Array.isArray(argv) || argv.length === 0 || argv.some(item => typeof item !== 'string' || !item)) {
+        throw new Error('沙箱 confine 必须返回非空的字符串数组');
+      }
+    }
+    this.child = spawn(argv[0], argv.slice(1), { cwd, env: { ...process.env, ...env }, shell: false, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     this.exited = new Promise(resolve => { this.resolveExit = resolve; });
     this.child.on('error', error => {
-      this.fail(new Error(`Cannot start language server ${command}: ${error.message}`));
+      this.fail(new Error(`Cannot start language server ${command}: ${error.message}${this.confined ? '（服务器进程受会话沙箱约束；若为写入被拒，请在 workspace-write 会话中使用或调整 sandbox 配置）' : ''}`));
       if (!this.child.pid) this.resolveExit();
     });
     this.child.on('exit', (code, signal) => {
-      this.fail(new Error(`Language server exited (${signal || code})${this.stderr ? `: ${this.stderr.trim()}` : ''}`));
+      // 受限会话里退出常常是沙箱拒绝写入（例如服务器想写自己的缓存目录）。
+      const hint = this.confined ? '（服务器进程受会话沙箱约束：若为写入被拒，请在 workspace-write 会话中使用，或用 sandbox.cacheDirectory 指向可写目录）' : '';
+      this.fail(new Error(`Language server exited (${signal || code})${this.stderr ? `: ${this.stderr.trim()}` : ''}${hint}`));
       this.resolveExit();
     });
     this.child.stdin.on('error', error => this.fail(new Error(`Language server stdin: ${error.message}`)));

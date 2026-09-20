@@ -29,6 +29,13 @@ function handle(m) {
   else if (m.method === 'textDocument/documentSymbol') result = [{ name: 'Example', kind: 12, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } } }];
   else if (m.method === 'workspace/symbol') result = [{ name: m.params.query, kind: 12, location: { uri: pathToFileURL('/mock').href, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } } }];
   else if (m.method === 'textDocument/diagnostic') result = { kind: 'full', items: [{ severity: 2, message: 'mock diagnostic', range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }] };
+  else if (m.method === 'textDocument/rename') {
+    // 把首个标识符替换为新名称，用于验证写入能力。
+    const text = documents.get(m.params.textDocument.uri) ?? '';
+    const length = (text.match(/^[A-Za-z_$][\w$]*/) ?? [''])[0].length;
+    result = { changes: { [m.params.textDocument.uri]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: length } }, newText: m.params.newName }] } };
+  } else if (m.method === 'textDocument/formatting') result = [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: '// formatted\n' }];
+  else if (m.method === 'workspace/applyEdit') result = { applied: true };
   else if (m.method === 'exit') process.exit(0);
   if (m.id !== undefined) send({ jsonrpc: '2.0', id: m.id, result });
 }

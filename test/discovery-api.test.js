@@ -76,12 +76,18 @@ test('发现 API：GET/POST 注册、会话绑定、权限门控与请求体校�
     assert.equal(noVerify.status, 200);
     assert.equal('verification' in await body(noVerify), false, '默认响应不包含验证结果，也不启动服务器');
 
+    // 只读诊断在任何权限下都可以进行。
     const restricted = host({ workspace, mode: 'workspace-write' });
-    const denied = await restricted.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
+    const scanned = await restricted.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'session-1' }),
     }));
+    assert.equal(scanned.status, 200);
+    // 验证会启动进程：受限会话且没有沙箱后端时必须拒绝，而不是无沙箱运行。
+    const denied = await restricted.route.fetch(new Request(`http://localhost${DISCOVERY_PATH}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'session-1', verify: true }),
+    }));
     assert.equal(denied.status, 403);
-    assert.match((await body(denied)).error.message, /danger-full-access/);
+    assert.match((await body(denied)).error.code, /sandbox-unavailable/);
     await Promise.all([...allowed.cleanups, ...restricted.cleanups].map(cleanup => cleanup()));
   } finally { await rm(workspace, { recursive: true, force: true }); }
 });

@@ -1,14 +1,18 @@
-import { realpath, stat, open, opendir } from 'node:fs/promises';
+import { realpath, stat, open, opendir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { LspTransport, abortError } from './transport.js';
+import { applyTextEdits, assertWriteAllowed, editForSingleFile, normalizeWorkspaceEdit, pathFromUri } from './edits.js';
 
 const METHODS = {
   hover: 'textDocument/hover', definition: 'textDocument/definition', references: 'textDocument/references',
   implementation: 'textDocument/implementation', typeDefinition: 'textDocument/typeDefinition',
   documentSymbols: 'textDocument/documentSymbol', workspaceSymbols: 'workspace/symbol',
+  rename: 'textDocument/rename', format: 'textDocument/formatting',
 };
-const POSITIONAL = new Set(['hover', 'definition', 'references', 'implementation', 'typeDefinition']);
+/** 会写磁盘的操作：需要显式 apply，并受会话权限约束。 */
+const WRITE_OPERATIONS = new Set(['rename', 'format']);
+const POSITIONAL = new Set(['hover', 'definition', 'references', 'implementation', 'typeDefinition', 'rename']);
 // 工作区符号的预热扫描边界：只为了找到一个可打开的文件，不做项目枚举。
 const WARMUP_SKIPPED_DIRECTORIES = new Set(['.git', 'node_modules', 'dist', 'build', 'target', 'out', 'coverage', '.next', '.cache', 'vendor']);
 const WARMUP_MAX_ENTRIES = 200;
@@ -72,6 +76,11 @@ export class LspManager {
   constructor(config = {}) {
     if (!config || typeof config !== 'object' || !Array.isArray(config.servers)) throw new Error('LSP config.servers must be an array');
     this.timeoutMs = positive(config.timeoutMs, 15000, 'timeoutMs', 300000);
+    // 受限会话的执行计划由池层解析后注入：confine 包装 argv，sandboxEnv 重定向缓存目录。
+    this.confine = typeof config.confine === 'function' ? config.confine : null;
+    // 写入模式由池层按会话权限解析：full=完全访问，workspace=只允许工作区内，deny=只读。
+    this.writeMode = ['full', 'workspace', 'deny'].includes(config.writeMode) ? config.writeMode : 'workspace';
+    this.sandboxEnv = config.sandboxEnv && typeof config.sandboxEnv === 'object' ? config.sandboxEnv : null;
     this.maxInstances = positive(config.maxInstances, 8, 'maxInstances', 128);
     this.maxFileBytes = positive(config.maxFileBytes, 2 * 1024 * 1024, 'maxFileBytes', 8 * 1024 * 1024);
     const ids = new Set();
@@ -234,9 +243,10 @@ export class LspManager {
       if (this.instances.size >= this.maxInstances) throw new Error(`LSP instance limit (${this.maxInstances}) reached; dispose the manager or increase maxInstances`);
       instance = { server: server.id, workspace, root, folders, queue: Promise.resolve(), documents: new Map(), diagnostics: new Map(), capabilities: {}, initialized: false };
       const workspaceFolders = folders.map(folder => ({ uri: uriFor(folder), name: path.basename(folder) || folder }));
-      instance.transport = new LspTransport({ ...server, cwd: root, timeoutMs: this.timeoutMs,
+      instance.transport = new LspTransport({ ...server, cwd: root, timeoutMs: this.timeoutMs, confine: this.confine,
+        env: { ...(this.sandboxEnv ?? {}), ...(server.env ?? {}) },
         onRequest: (method, params) => {
-          if (method === 'workspace/applyEdit') return { applied: false, failureReason: 'This LSP client is read-only' };
+          if (method === 'workspace/applyEdit') return this.applyServerEdit(params?.edit, workspace, signal);
           if (method === 'workspace/workspaceFolders') return workspaceFolders;
           if (method === 'workspace/configuration') return (params?.items || []).map(item => {
             if (!item.section) return server.settings ?? {};
@@ -265,7 +275,7 @@ export class LspManager {
           initializationOptions: server.initializationOptions ?? null,
           capabilities: {
             general: { positionEncodings: ['utf-16'] },
-            workspace: { applyEdit: false, configuration: true, workspaceFolders: true },
+            workspace: { applyEdit: this.writeMode !== 'deny', configuration: true, workspaceFolders: true },
             textDocument: { synchronization: { dynamicRegistration: false, didSave: false }, diagnostic: { dynamicRegistration: false }, publishDiagnostics: { versionSupport: true }, hover: { contentFormat: ['plaintext', 'markdown'] } },
           },
         }, { signal });
@@ -284,6 +294,49 @@ export class LspManager {
     await instance.ready;
     checkAbort(signal);
     return instance;
+  }
+
+  /**
+   * 应用语言服务器返回的编辑。
+   * dryRun 时只返回计划；真正写入前逐个文件校验权限与路径。
+   */
+  async applyEdit({ edit, workspace, signal, dryRun }) {
+    const files = normalizeWorkspaceEdit(edit);
+    const planned = [];
+    for (const entry of files) {
+      checkAbort(signal);
+      const file = pathFromUri(entry.uri);
+      if (file === null) throw new Error(`无法解析目标文件 URI：${entry.uri}`);
+      // 先判权限（只读会话要给出“需要完全访问权限”的明确提示），再判工作区边界。
+      assertWriteAllowed({ mode: this.writeMode, workspace, file });
+      let checked;
+      try {
+        checked = await safePath(workspace, file);
+      } catch {
+        throw new Error(`目标文件不在会话工作区内：${file}。插件只在会话工作区内应用语言服务器的编辑。`);
+      }
+      const text = await this.readDocument(workspace, checked);
+      const next = applyTextEdits(text, entry.edits);
+      planned.push({ uri: entry.uri, file: checked, edits: entry.edits.length, changed: next !== text, next });
+    }
+    if (dryRun) return { applied: false, dryRun: true, files: planned.map(({ uri, file, edits, changed }) => ({ uri, file, edits, changed })) };
+    for (const item of planned) {
+      checkAbort(signal);
+      if (item.changed) await writeFile(item.file, item.next);
+    }
+    return { applied: true, dryRun: false, files: planned.map(({ uri, file, edits, changed }) => ({ uri, file, edits, changed })) };
+  }
+
+  /** 服务器主动请求应用编辑（例如代码动作）；失败原因会回传给服务器。 */
+  async applyServerEdit(edit, workspace, signal) {
+    try {
+      const result = await this.applyEdit({ edit, workspace, signal, dryRun: false });
+      return { applied: result.files.some(item => item.changed) };
+    } catch (error) {
+      // 只读或工作区外被拒时，把“需要完全访问权限”的原因如实回传。
+      if (signal?.aborted) return { applied: false, failureReason: 'LSP request aborted' };
+      return { applied: false, failureReason: error.message };
+    }
   }
 
   waitForDiagnostics(instance, uri, signal) {
@@ -375,6 +428,10 @@ export class LspManager {
     if (!input || typeof input !== 'object') throw new Error('LSP execute requires an argument object');
     const { operation, server: serverId } = input;
     if (operation !== 'status' && operation !== 'diagnostics' && !Object.hasOwn(METHODS, operation)) throw new Error(`Unsupported LSP operation: ${operation}`);
+    const isWrite = WRITE_OPERATIONS.has(operation);
+    if (isWrite && this.writeMode === 'deny') {
+      throw new Error(`当前会话是只读权限，${operation} 不会写入磁盘。需要完全访问权限（danger-full-access）才能应用语言服务器的修改。`);
+    }
     workspace = await realpath(path.resolve(workspace));
     if (!(await stat(workspace)).isDirectory()) throw new Error('Workspace must be a directory');
     if (operation === 'status') return {
@@ -400,14 +457,20 @@ export class LspManager {
     const instance = await this.instanceFor(server, workspace, root, folders, signal);
     return queued(instance, async () => {
       if (this.disposed) throw new Error('LSP manager is disposed');
+      // 预热必须在打开目标文件之前：warmup 以“已有打开文档”为跳过条件，
+      // 而 rename 会先 didOpen 目标文件，晚于它调用就等于没有预热。
+      if (operation === 'workspaceSymbols' || operation === 'rename') await this.warmup(server, instance, workspace, signal);
       let uri, text;
       if (file) {
         text = await this.readDocument(workspace, file);
         checkAbort(signal);
         uri = this.syncDocument(instance, file, this.language(server, file), text);
       }
-      if (operation === 'workspaceSymbols') await this.warmup(server, instance, workspace, signal);
-      const params = operation === 'workspaceSymbols' ? { query: typeof input.query === 'string' ? input.query : '' } : { textDocument: { uri } };
+      const params = operation === 'workspaceSymbols'
+        ? { query: typeof input.query === 'string' ? input.query : '' }
+        : operation === 'format'
+          ? { textDocument: { uri }, options: { tabSize: Number.isSafeInteger(input.tabSize) ? input.tabSize : 2, insertSpaces: input.insertSpaces !== false } }
+          : { textDocument: { uri } };
       if (POSITIONAL.has(operation)) {
         if (!Number.isSafeInteger(input.line) || input.line < 1 || !Number.isSafeInteger(input.character) || input.character < 1) throw new Error('line and character must be positive 1-based UTF-16 integers');
         const lines = text.split(/\r\n|\n|\r/);
@@ -415,6 +478,10 @@ export class LspManager {
         params.position = { line: input.line - 1, character: input.character - 1 };
       }
       if (operation === 'references') params.context = { includeDeclaration: true };
+      if (operation === 'rename') {
+        if (typeof input.newName !== 'string' || !input.newName) throw new Error('rename requires newName');
+        params.newName = input.newName;
+      }
       if (operation === 'diagnostics') {
         if (instance.capabilities.diagnosticProvider) {
           const provider = instance.capabilities.diagnosticProvider;
@@ -431,7 +498,13 @@ export class LspManager {
         const cached = await this.waitForDiagnostics(instance, uri, signal);
         return { uri, diagnostics: cached?.diagnostics ?? [], source: 'push', pending: !cached, version: cached?.version ?? null };
       }
-      return await instance.transport.request(METHODS[operation], params, { signal });
+      const response = await instance.transport.request(METHODS[operation], params, { signal });
+      if (!isWrite) return response;
+      // 格式化的返回是 TextEdit[]，重命名返回 WorkspaceEdit；统一按 WorkspaceEdit 应用。
+      const edit = operation === 'format' ? editForSingleFile(uri, response) : response;
+      if (edit === null || edit === undefined) return { applied: false, dryRun: input.apply !== true, files: [] };
+      const applied = await this.applyEdit({ edit, workspace, signal, dryRun: input.apply !== true });
+      return { operation, ...applied };
     }, signal);
   }
 
@@ -451,8 +524,8 @@ export class LspManager {
  * 用于安装后验证“能找到程序”确实等于“能工作”；不保留任何常驻实例。
  * 失败时抛出包含服务器 stderr 的错误，便于直接展示原因。
  */
-export async function probeLanguageServer({ server, workspace, root, timeoutMs = 15000, signal } = {}) {
-  const manager = new LspManager({ servers: [server], timeoutMs, maxInstances: 1 });
+export async function probeLanguageServer({ server, workspace, root, timeoutMs = 15000, signal, confine, env } = {}) {
+  const manager = new LspManager({ servers: [server], timeoutMs, maxInstances: 1, confine, sandboxEnv: env });
   try {
     const parsed = manager.servers[0];
     const resolved = await manager.rootFor(parsed, workspace, undefined, root === undefined ? undefined : root);

@@ -1,6 +1,6 @@
 import { isAbsolute } from 'node:path';
 import z from '@deepseek-ai/schemastery';
-import { LspSessionPool, POLICY_POLL_INTERVAL_MS } from './pool.js';
+import { LspSessionPool, POLICY_POLL_INTERVAL_MS, normalizeSandboxConfig } from './pool.js';
 import { probeLanguageServer } from './engine.js';
 import { MAX_VERIFY_SERVERS, VERIFY_TIMEOUT_MS, applyInstallPlan, configServersFromDiagnosis, diagnoseWorkspace, mergeServersIntoConfig, normalizeInstallConfig, verifyDiagnosis } from './setup.js';
 import { CONTEXT_ORDER, DiagnosisCache, renderLspContext } from './context.js';
@@ -11,7 +11,9 @@ export const inject = ['tools', 'sandboxPolicy'];
 export const SETTINGS_NAMESPACE = 'dsh-lsp-bridge';
 export const DISCOVERY_PATH = '/api/dsh-lsp-bridge/discovery';
 export const DISCOVERY_MAX_BODY_BYTES = 16 * 1024;
-export const OPERATIONS = ['status', 'hover', 'definition', 'references', 'implementation', 'typeDefinition', 'documentSymbols', 'workspaceSymbols', 'diagnostics'];
+export const OPERATIONS = ['status', 'hover', 'definition', 'references', 'implementation', 'typeDefinition', 'documentSymbols', 'workspaceSymbols', 'diagnostics', 'rename', 'format'];
+/** 会写磁盘的操作：需要 apply=true，并受会话权限约束。 */
+export const WRITE_OPERATIONS = new Set(['rename', 'format']);
 export const SETUP_OPERATIONS = ['status', 'install', 'configure', 'verify', 'auto'];
 export { MAX_VERIFY_SERVERS };
 const POSITION_OPERATIONS = new Set(['hover', 'definition', 'references', 'implementation', 'typeDefinition']);
@@ -23,10 +25,12 @@ function strings(value, label) { assert(Array.isArray(value) && value.every(none
 /** Validate trusted administrator configuration; model calls cannot supply commands or environment. */
 export function validateConfig(input = {}) {
   assert(object(input), 'config must be an object');
-  const allowed = new Set(['servers', 'timeoutMs', 'maxInstances', 'maxFileBytes', 'maxOutputChars', 'idleTimeoutMs', 'maxSessions', 'install']);
+  const allowed = new Set(['servers', 'timeoutMs', 'maxInstances', 'maxFileBytes', 'maxOutputChars', 'idleTimeoutMs', 'maxSessions', 'install', 'sandbox']);
   for (const key of Object.keys(input)) assert(allowed.has(key), `unknown config key ${key}`);
   const config = { servers: [], timeoutMs: 15000, maxInstances: 8, maxFileBytes: 1048576, maxOutputChars: 30000, idleTimeoutMs: 300000, maxSessions: 4, ...input };
   try { config.install = normalizeInstallConfig(config.install); }
+  catch (error) { assert(false, error.message); }
+  try { config.sandbox = normalizeSandboxConfig(config.sandbox); }
   catch (error) { assert(false, error.message); }
   const ranges = { timeoutMs: [1, 300000], maxInstances: [1, 128], maxFileBytes: [1, 8 * 1024 * 1024], maxOutputChars: [256, Number.MAX_SAFE_INTEGER], idleTimeoutMs: [1, 2147483647], maxSessions: [1, 128] };
   for (const [key, [min, max]] of Object.entries(ranges)) assert(Number.isSafeInteger(config[key]) && config[key] >= min && config[key] <= max, `${key} must be an integer between ${min} and ${max}`);
@@ -98,13 +102,17 @@ function restoreEnvironment(config, base) {
 export const parameters = {
   type: 'object', additionalProperties: false, required: ['operation'],
   properties: {
-    operation: { type: 'string', enum: OPERATIONS, description: '只读语言服务器操作。' },
+    operation: { type: 'string', enum: OPERATIONS, description: '语言服务器操作；rename/format 会写入磁盘，需要 apply=true。' },
     file: { type: 'string', description: '相对于调用会话工作区的文件路径，或工作区内的绝对路径；文档操作必填。' },
     line: { type: 'integer', description: '位置操作的行号，从 1 开始。' },
     character: { type: 'integer', description: '位置操作的 UTF-16 字符偏移，从 1 开始。' },
     query: { type: 'string', description: '工作区符号搜索关键字。' },
     server: { type: 'string', description: '可选的已配置服务 ID，用于消除语言匹配歧义。' },
     root: { type: 'string', description: '可选的会话工作区内项目根目录，适用于多根符号查询。' },
+    newName: { type: 'string', description: 'rename 的新名称。' },
+    apply: { type: 'boolean', description: 'rename/format 是否真正写入；省略或 false 时只返回将要改动的内容。' },
+    tabSize: { type: 'integer', description: 'format 的缩进宽度，默认 2。' },
+    insertSpaces: { type: 'boolean', description: 'format 是否使用空格缩进，默认 true。' },
   },
 };
 
@@ -118,6 +126,11 @@ export function validateArgs(args) {
   if (!['status', 'workspaceSymbols'].includes(args.operation)) assert(nonempty(args.file), 'this operation requires file');
   if (POSITION_OPERATIONS.has(args.operation)) for (const key of ['line', 'character']) assert(Number.isSafeInteger(args[key]) && args[key] >= 1, `this operation requires one-based ${key}`);
   if (args.operation === 'workspaceSymbols') assert(typeof args.query === 'string', 'workspaceSymbols requires query (may be empty)');
+  if (args.newName !== undefined) assert(nonempty(args.newName), 'newName must be a nonempty string');
+  if (args.apply !== undefined) assert(typeof args.apply === 'boolean', 'apply must be a boolean');
+  if (args.insertSpaces !== undefined) assert(typeof args.insertSpaces === 'boolean', 'insertSpaces must be a boolean');
+  if (args.tabSize !== undefined) assert(Number.isSafeInteger(args.tabSize) && args.tabSize >= 1 && args.tabSize <= 16, 'tabSize must be an integer between 1 and 16');
+  if (args.operation === 'rename') assert(nonempty(args.newName), 'rename requires newName');
   return args;
 }
 
@@ -205,7 +218,7 @@ function setupTargets(diagnosis, server) {
 /**
  * 执行一次 lsp_setup 调用。installation 只有在 operation 为 install/auto 且 apply===true 时才会发生。
  */
-export async function runSetup({ operation, args, workspace, config, scope, cache, signal, probe = probeLanguageServer, diagnose = diagnoseWorkspace, install = applyInstallPlan }) {
+export async function runSetup({ operation, args, workspace, config, scope, cache, execution = null, signal, probe = probeLanguageServer, diagnose = diagnoseWorkspace, install = applyInstallPlan }) {
   const server = args.server;
   const languages = parseLanguages(args.languages);
   const diagnoseOnce = () => diagnose({ workspace, languages, install: config.install, configured: config.servers, signal });
@@ -256,7 +269,7 @@ export async function runSetup({ operation, args, workspace, config, scope, cach
 
   if (operation === 'verify' || operation === 'auto') {
     const scoped = server === undefined ? diagnosis : { ...diagnosis, servers: setupTargets(diagnosis, server) };
-    const verification = await verifyDiagnosis(scoped, { workspace, signal, probe, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS) });
+    const verification = await verifyDiagnosis(scoped, { workspace, signal, probe, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution?.confine ?? null, env: execution?.env ?? null });
     if (verification.length) result.verification.push(...verification);
     else result.verification.push({ ok: false, reason: '没有可验证的服务器：需要已发现的程序且运行组件齐备。' });
   }
@@ -349,7 +362,21 @@ export function apply(ctx, input = {}) {
   let config = baseConfig;
   const retiring = new Set();
   const environmentBase = structuredClone(baseConfig);
-  const makePool = value => new LspSessionPool(value, session => ctx.sandboxPolicy.resolve({ session }));
+  // 受限会话下的进程约束来自 sandbox 服务；它可能尚未加载，因此按需读取而不是创建时快照。
+  let sandboxService = null;
+  if (typeof ctx.inject === 'function') ctx.inject(['sandbox'], sandboxCtx => { sandboxService = sandboxCtx.sandbox; });
+  const makePool = value => new LspSessionPool(value, session => ctx.sandboxPolicy.resolve({ session }), {
+    confine: (argv, policy) => {
+      if (sandboxService === null) {
+        const error = new Error('no sandbox service is loaded');
+        error.code = 'SANDBOX_UNAVAILABLE';
+        throw error;
+      }
+      return sandboxService.confine(argv, policy).argv;
+    },
+    sandbox: value.sandbox,
+    hasSandbox: () => sandboxService !== null,
+  });
   let pool = makePool(config);
   let disposed = false;
   // lsp_setup 写入配置的宿主入口；settings 不可用时保持 null 并如实报告。
@@ -421,17 +448,16 @@ export function apply(ctx, input = {}) {
         if (!session || !nonempty(session.header?.cwd) || !isAbsolute(session.header.cwd)) {
           return errorResponse(404, 'session-not-found', '找不到可用于发现的活动会话。');
         }
-        let policy;
-        try { policy = ctx.sandboxPolicy.resolve({ session }); }
-        catch { return errorResponse(500, 'policy-failure', '无法核对会话权限。'); }
-        if (policy?.mode !== 'danger-full-access') {
-          return errorResponse(403, 'danger-full-access-required', '自动发现目前仅允许 danger-full-access 会话；不会自动提权。');
-        }
         try {
-          // 默认只做只读诊断；verify=true 时对可用服务器做一次短暂启动验证（initialize 后立即关闭）。
+          // 只读诊断在任何权限下都可以做；验证会启动进程，因此受限会话必须经由会话沙箱约束。
           const diagnosis = await diagnoseWorkspace({ workspace: session.header.cwd, languages: parsed.body.languages, install: config.install, configured: config.servers, signal: request.signal });
+          let execution = null;
+          if (parsed.body.verify === true) {
+            try { execution = pool.executionFor(session); }
+            catch (error) { return errorResponse(403, 'sandbox-unavailable', `当前会话（${error.message.includes('danger-full-access') ? '受限权限且没有可用沙箱后端' : '未知权限'}）无法安全地启动语言服务器进行验证。`); }
+          }
           const verification = parsed.body.verify === true
-            ? await verifyDiagnosis(diagnosis, { workspace: session.header.cwd, signal: request.signal, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS) })
+            ? await verifyDiagnosis(diagnosis, { workspace: session.header.cwd, signal: request.signal, timeoutMs: Math.min(config.timeoutMs, VERIFY_TIMEOUT_MS), confine: execution.confine, env: execution.env })
             : null;
           const result = verification === null ? diagnosis : { ...diagnosis, verification };
           diagnosisCache.set(session.header.cwd, result);
@@ -449,7 +475,7 @@ export function apply(ctx, input = {}) {
 
   ctx.tools.register({
     name: 'lsp',
-    description: `查询可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号和诊断。插件会把当前工作区已配置的语言服务自动注入上下文，通常不必先探路。workspaceSymbols 无文件可推断语言时，会先按“是否覆盖当前工作区”自动选择服务器，只有多个都覆盖时才要求显式传 server；冷启动时会先做一次有界预热打开项目文件，避免 TypeScript 报 No Project. 或返回空结果。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。不暴露编辑或命令。服务是未经 OS 沙箱隔离的可信程序，每次调用要求 danger-full-access，绝不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查。`,
+    description: `查询与修改可信配置的语言服务器：悬停、定义、引用、实现、类型定义、文档/工作区符号、诊断，以及 rename/format 这类会写磁盘的操作。rename/format 只在 apply=true 时写入，否则只返回将要改动的内容；写入受会话权限约束（只读会话直接拒绝，workspace-write 只允许工作区内的文件），被拒绝时会说明需要完全访问权限（danger-full-access）。插件会把当前工作区已配置的语言服务自动注入上下文，通常不必先探路。workspaceSymbols 无文件可推断语言时，会先按“是否覆盖当前工作区”自动选择服务器，只有多个都覆盖时才要求显式传 server；冷启动时会先做一次有界预热打开项目文件，避免 TypeScript 报 No Project. 或返回空结果。输入行号与 UTF-16 字符偏移从 1 开始，输出 LSP 范围从 0 开始。按会话对象身份和 cwd 隔离常驻复用；status 展示配置及当前存活实例，不启动服务。不暴露编辑或命令。服务是可信的本地程序：danger-full-access 会话直接启动；受限会话（workspace-write/read-only）会先由 DSH 沙箱包装服务器进程，使其只能写会话工作区与临时目录；部署没有可用沙箱后端时失败关闭，绝不无沙箱启动，也不自动提权。权限收紧/会话销毁事件立即取消并关闭服务；有效权限另以 ${POLICY_POLL_INTERVAL_MS} 毫秒间隔检查。`,
     parameters,
     output: {
       schema: { type: 'object', additionalProperties: false, required: ['json', 'truncated'], properties: { json: { type: 'string' }, truncated: { type: 'boolean' } } },
@@ -471,12 +497,16 @@ export function apply(ctx, input = {}) {
         throw error;
       }
     },
-    presentCall: args => ({ card: 'generic', title: `LSP ${args.operation}${args.file ? ` ${args.file}` : ''}`, kind: 'read' }),
+    presentCall: args => ({
+      card: 'generic',
+      title: `LSP ${args.operation}${args.file ? ` ${args.file}` : ''}`,
+      kind: WRITE_OPERATIONS.has(args.operation) && args.apply === true ? 'edit' : 'read',
+    }),
   });
 
   ctx.tools.register({
     name: 'lsp_setup',
-    description: `自动准备语言服务器，无需人工扫描或手写配置：诊断工作区项目所需的 LSP 服务器及其运行组件（例如 TypeScript 的 tsserver），按固定允许列表安装缺失组件，把可用服务器写入插件配置，并真实启动一次完成 initialize 验证。你只能提供本目录中的服务器 ID（gopls、rust-analyzer、typescript-language-server、pyright、clangd）；不能提供命令、参数、包名或安装路径。安装命令来自冻结的 catalog（go/npm/rustup/cargo/venv/brew），不经 shell、不使用 sudo；只有 operation=install/auto 且显式 apply=true 才执行安装，status 与 verify 从不安装。安装目录默认 $DSH_HOME/lsp-bridge，可由 config.install 调整，install.enabled=false 可整体禁用。每次调用都要求目标会话为 danger-full-access，绝不自动提权。典型用法：先 status 查看缺什么，再 auto + apply=true 一次完成安装、配置与验证。`,
+    description: `自动准备语言服务器，无需人工扫描或手写配置：诊断工作区项目所需的 LSP 服务器及其运行组件（例如 TypeScript 的 tsserver），按固定允许列表安装缺失组件，把可用服务器写入插件配置，并真实启动一次完成 initialize 验证。你只能提供本目录中的服务器 ID（gopls、rust-analyzer、typescript-language-server、pyright、clangd）；不能提供命令、参数、包名或安装路径。安装命令来自冻结的 catalog（go/npm/rustup/cargo/venv/brew），不经 shell、不使用 sudo；只有 operation=install/auto 且显式 apply=true 才执行安装，status 与 verify 从不安装。安装目录默认 $DSH_HOME/lsp-bridge，可由 config.install 调整，install.enabled=false 可整体禁用。status/configure/verify 在受限会话同样可用（验证会由会话沙箱约束服务器进程）；只有真正执行安装命令的步骤要求 danger-full-access，因为安装器在插件内直接执行、不经过会话沙箱。绝不自动提权。典型用法：先 status 查看缺什么，再 auto + apply=true 一次完成安装、配置与验证。`,
     parameters: setupParameters,
     output: {
       schema: { type: 'object', additionalProperties: false, required: ['json', 'truncated'], properties: { json: { type: 'string' }, truncated: { type: 'boolean' } } },
@@ -491,10 +521,20 @@ export function apply(ctx, input = {}) {
       let policy;
       try { policy = ctx.sandboxPolicy.resolve({ session }); }
       catch { throw new Error('无法核对会话权限，已拒绝执行语言服务器安装。'); }
-      if (policy?.mode !== 'danger-full-access') {
-        throw new Error(`lsp_setup 需要 danger-full-access 会话（当前 ${policy?.mode ?? 'unknown'}）；安装与配置不会在受限会话中执行，也不会自动提权。`);
+      // status / configure / verify 不执行安装命令，受限会话同样可用（验证由会话沙箱约束）；
+      // 只有真正运行安装命令时才要求完全访问，因为安装器在插件内直接执行。
+      const installs = args.operation === 'install' || (args.operation === 'auto' && args.apply === true);
+      if (installs && policy?.mode !== 'danger-full-access') {
+        throw new Error(`lsp_setup 的安装步骤需要 danger-full-access 会话（当前 ${policy?.mode ?? 'unknown'}）：安装器在插件内直接执行，不经过会话沙箱，也不会自动提权。可以先在受限会话中完成 status/verify。`);
       }
-      const result = await runSetup({ operation: args.operation, args, workspace: session.header.cwd, config, scope: settingsScope, cache: diagnosisCache, signal: exec.signal });
+      let execution = null;
+      try { execution = pool.executionFor(session); }
+      catch (error) {
+        if (installs) throw error;
+        // 受限会话且没有沙箱后端：诊断仍然可用，只是不能启动服务器。
+        execution = { confine: null, env: null };
+      }
+      const result = await runSetup({ operation: args.operation, args, workspace: session.header.cwd, config, scope: settingsScope, cache: diagnosisCache, execution, signal: exec.signal });
       return boundedResult(result, config.maxOutputChars);
     },
     presentCall: args => ({

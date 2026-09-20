@@ -336,7 +336,7 @@ window.__ModuleLoader__.load({
                 sessions.length ? sessions.map(session => h('option', { key: session.id, value: session.id, title: `${session.cwd}\n${session.id}` }, sessionLabel(session))) : h('option', { value: '' }, '没有活动会话'))),
             h('button', { type: 'button', disabled: busy, onClick: () => { void refreshSessions(); } }, '刷新会话'),
             h('button', { type: 'button', className: 'lsp-primary', disabled: busy || !sessionId, onClick: () => { void discover(); } }, '扫描当前工作区')),
-          h('p', { className: 'lsp-muted' }, sessions.length ? '扫描要求所选会话为 danger-full-access；不会自动提权。扫描目录不决定保存范围，配置由当前 Host 共用。' : '先打开一个工程会话，再刷新列表。也可以直接在下方高级配置 JSON 中手工添加。'),
+          h('p', { className: 'lsp-muted' }, sessions.length ? '扫描只读，任何权限的会话都可以；验证会启动服务器，受限会话中服务器进程由会话沙箱约束（只能写工作区与临时目录），拿不到沙箱后端则失败关闭。不会自动提权。' : '先打开一个工程会话，再刷新列表。也可以直接在下方高级配置 JSON 中手工添加。'),
           activeCwd ? h('p', { className: 'lsp-muted lsp-ellipsis', title: `${activeCwd}\n${sessionId}` }, `当前会话目录：${activeCwd}`) : null),
         h('section', { className: 'lsp-section', key: 'candidates' },
           step('2', '候选审阅', '检查程序路径、运行组件与项目范围。缺组件的服务器可以让智能体自动安装并写回配置。'),
